@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiveKit webcam publisher</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    label { display: block; margin-bottom: .25rem; font-weight: 600; }
+    input, button, textarea { width: 100%; box-sizing: border-box; padding: .7rem; font: inherit; }
+    textarea { min-height: 9rem; }
+    button { cursor: pointer; }
+    video { width: 100%; background: #111; border-radius: 8px; aspect-ratio: 16 / 9; }
+    .muted { color: #666; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
+    code { background: #f4f4f4; padding: .15rem .35rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>LiveKit webcam publisher</h1>
+  <p class="muted">This page publishes <strong>video only</strong>. It also generates a separate <strong>viewer token</strong> for your Qt app so you do not collide with the publisher identity.</p>
+
+  <div class="card row">
+    <div>
+      <label for="room">Room</label>
+      <input id="room" value="qt-test-room">
+    </div>
+    <div>
+      <label for="pubIdentity">Publisher identity</label>
+      <input id="pubIdentity" value="webcam-publisher">
+    </div>
+    <div>
+      <label for="viewerIdentity">Viewer identity</label>
+      <input id="viewerIdentity" value="qt-viewer">
+    </div>
+    <div>
+      <label for="apiUrl">LiveKit wsUrl for Qt app</label>
+      <input id="apiUrl" readonly>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; gap: .75rem; flex-wrap: wrap; margin-bottom: 1rem;">
+      <button id="startBtn">Start webcam publisher</button>
+      <button id="stopBtn" disabled>Disconnect</button>
+    </div>
+    <div id="status" class="muted">Idle.</div>
+    <div style="margin-top:1rem;">
+      <video id="preview" autoplay playsinline muted></video>
+    </div>
+  </div>
+
+  <div class="card">
+    <label for="viewerToken">Viewer token for Qt app</label>
+    <textarea id="viewerToken" readonly></textarea>
+    <p class="muted">Paste <code>wsUrl</code> and this token into your Qt app. Use the same room shown above.</p>
+  </div>
+
+  <script type="module">
+    import { Room } from 'https://esm.sh/livekit-client@2.18.3';
+
+    const roomEl = document.getElementById('room');
+    const pubIdentityEl = document.getElementById('pubIdentity');
+    const viewerIdentityEl = document.getElementById('viewerIdentity');
+    const apiUrlEl = document.getElementById('apiUrl');
+    const viewerTokenEl = document.getElementById('viewerToken');
+    const statusEl = document.getElementById('status');
+    const previewEl = document.getElementById('preview');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+
+    let room = null;
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    async function mintToken(identity, role) {
+      const res = await fetch('/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          room: roomEl.value.trim(),
+          identity,
+          role,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+      return await res.json();
+    }
+
+    async function start() {
+      startBtn.disabled = true;
+      try {
+        setStatus('Minting tokens...');
+        const pub = await mintToken(pubIdentityEl.value.trim(), 'publisher');
+        const viewer = await mintToken(viewerIdentityEl.value.trim(), 'viewer');
+        apiUrlEl.value = viewer.wsUrl;
+        viewerTokenEl.value = viewer.token;
+
+        room = new Room();
+
+        setStatus('Connecting publisher...');
+        await room.connect(pub.wsUrl, pub.token, { autoSubscribe: false });
+
+        setStatus('Enabling camera (video only)...');
+        await room.localParticipant.setCameraEnabled(true);
+        await room.localParticipant.setMicrophoneEnabled(false);
+
+        const videoPub = Array.from(room.localParticipant.videoTrackPublications.values())[0];
+        if (videoPub?.videoTrack) {
+          const el = videoPub.videoTrack.attach();
+          el.autoplay = true;
+          el.playsInline = true;
+          el.muted = true;
+          previewEl.replaceWith(el);
+          el.id = 'preview';
+        }
+
+        setStatus(`Connected. Room: ${pub.room}. Publisher identity: ${pub.identity}. Viewer token ready for Qt app.`);
+        stopBtn.disabled = false;
+      } catch (err) {
+        console.error(err);
+        setStatus(`Error: ${err.message || err}`);
+        if (room) {
+          room.disconnect();
+          room = null;
+        }
+        startBtn.disabled = false;
+      }
+    }
+
+    function stop() {
+      if (room) {
+        room.disconnect();
+        room = null;
+      }
+      setStatus('Disconnected.');
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+
+    fetch('/healthz').then(r => r.json()).then(info => {
+      apiUrlEl.value = info.wsUrl;
+      roomEl.value = info.defaultRoom;
+    }).catch(() => {});
+  </script>
+</body>
+</html>

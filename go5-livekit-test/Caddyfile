@@ -1,0 +1,21 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+    encode zstd gzip
+
+    handle /publish* {
+        reverse_proxy app:3000
+    }
+
+    handle /token* {
+        reverse_proxy app:3000
+    }
+
+    handle /healthz {
+        reverse_proxy app:3000
+    }
+
+    reverse_proxy livekit:7880
+}

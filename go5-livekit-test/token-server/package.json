@@ -1,0 +1,9 @@
+{
+  "name": "go5-livekit-token-server",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "express": "^4.21.2",
+    "livekit-server-sdk": "^2.15.1"
+  }
+}
