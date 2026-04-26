@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew list:*)",
+      "Read(//opt/homebrew/opt/**)",
+      "Read(//usr/local/**)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(cmake -B /Users/test/Programming/Lumana/livekit_demo/videowall/build -DCMAKE_PREFIX_PATH=\"/opt/homebrew/opt/qt;/Users/test/Programming/Lumana/livekit_demo/third_party/livekit-sdk\" -S /Users/test/Programming/Lumana/livekit_demo/videowall)",
+      "Bash(cmake --build /Users/test/Programming/Lumana/livekit_demo/videowall/build)",
+      "Bash(cmake:*)"
+    ]
+  }
+}
