@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "livekitplayer.h"
+#include "videocell.h"
 
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -69,9 +70,11 @@ void MainWindow::startPlayback() {
 
   for (int i = 0; i < streams_.size(); ++i) {
     auto *player = new LiveKitPlayer(this);
+    VideoCell *cell = videoCells_[i];
 
-    connect(player, &LiveKitPlayer::frameReady, this, [this, i](const QImage &frame) {
-      onFrameReady(i, frame);
+    connect(player, &LiveKitPlayer::frameReady, this, [player, cell](const QImage &frame) {
+      player->clearFrameInFlight();
+      cell->uploadFrame(frame);
     });
     connect(player, &LiveKitPlayer::statusChanged, this, &MainWindow::onStatusChanged);
     connect(player, &LiveKitPlayer::errorOccurred, this, &MainWindow::onError);
@@ -85,21 +88,9 @@ void MainWindow::stopPlayback() {
   clearPlayers();
   setButtonStates(false);
   statusLabel_->setText(QStringLiteral("Stopped"));
-
-  for (auto *label : videoLabels_) {
-    label->setText(QStringLiteral("No video"));
-    label->setPixmap(QPixmap());
+  for (auto *cell : videoCells_) {
+    cell->clearFrame();
   }
-}
-
-void MainWindow::onFrameReady(int index, const QImage &frame) {
-  if (index < 0 || index >= videoLabels_.size()) {
-    return;
-  }
-  QLabel *label = videoLabels_[index];
-  const QPixmap pixmap = QPixmap::fromImage(frame).scaled(
-      label->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
-  label->setPixmap(pixmap);
 }
 
 void MainWindow::onStatusChanged(const QString &status) {
@@ -112,7 +103,7 @@ void MainWindow::onError(const QString &errorMessage) {
 
 void MainWindow::clearPlayers() {
   for (auto *player : players_) {
-    player->disconnect(); // prevent queued signals hitting a deleted object
+    player->disconnect();
     player->stopPlayback();
     delete player;
   }
@@ -120,28 +111,20 @@ void MainWindow::clearPlayers() {
 }
 
 void MainWindow::rebuildGrid() {
-  // Remove existing labels from grid
-  for (auto *label : videoLabels_) {
-    videoGrid_->removeWidget(label);
-    delete label;
+  for (auto *cell : videoCells_) {
+    videoGrid_->removeWidget(cell);
+    delete cell;
   }
-  videoLabels_.clear();
+  videoCells_.clear();
 
   const int n = streams_.size();
   const int cols = static_cast<int>(std::ceil(std::sqrt(n)));
-  const int rows = (n + cols - 1) / cols;
 
   for (int i = 0; i < n; ++i) {
-    auto *label = new QLabel(QStringLiteral("Connecting..."), videoGridWidget_);
-    label->setMinimumSize(320, 180);
-    label->setStyleSheet(QStringLiteral("background-color: black; color: #cccccc;"));
-    label->setAlignment(Qt::AlignCenter);
-    label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    videoGrid_->addWidget(label, i / cols, i % cols);
-    videoLabels_.append(label);
+    auto *cell = new VideoCell(videoGridWidget_);
+    videoGrid_->addWidget(cell, i / cols, i % cols);
+    videoCells_.append(cell);
   }
-
-  Q_UNUSED(rows);
 }
 
 void MainWindow::createUi() {
@@ -170,16 +153,15 @@ void MainWindow::createUi() {
   connect(stopButton_, &QPushButton::clicked, this, &MainWindow::stopPlayback);
 
   videoGridWidget_ = new QWidget(centralWidget);
+  videoGridWidget_->setStyleSheet(QStringLiteral("background-color: black;"));
   videoGrid_ = new QGridLayout(videoGridWidget_);
   videoGrid_->setSpacing(4);
+  videoGrid_->setContentsMargins(0, 0, 0, 0);
 
-  // Placeholder until Play is pressed
-  auto *placeholderLabel = new QLabel(QStringLiteral("No video"), videoGridWidget_);
-  placeholderLabel->setMinimumSize(640, 360);
-  placeholderLabel->setStyleSheet(QStringLiteral("background-color: black; color: #cccccc;"));
-  placeholderLabel->setAlignment(Qt::AlignCenter);
-  videoGrid_->addWidget(placeholderLabel, 0, 0);
-  videoLabels_.append(placeholderLabel);
+  // Placeholder cell until Play is pressed
+  auto *placeholder = new VideoCell(videoGridWidget_);
+  videoGrid_->addWidget(placeholder, 0, 0);
+  videoCells_.append(placeholder);
 
   statusLabel_ = new QLabel(QStringLiteral("Idle"), centralWidget);
 

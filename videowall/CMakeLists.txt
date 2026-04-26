@@ -10,7 +10,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
 set(LiveKit_DIR "${CMAKE_SOURCE_DIR}/../third_party/livekit-sdk/lib/cmake/LiveKit")
 find_package(LiveKit CONFIG REQUIRED)
 
@@ -20,11 +20,15 @@ add_executable(videowall
     src/mainwindow.h
     src/livekitplayer.cpp
     src/livekitplayer.h
+    src/videocell.cpp
+    src/videocell.h
 )
 
 target_link_libraries(videowall
     PRIVATE
         Qt6::Widgets
+        Qt6::OpenGL
+        Qt6::OpenGLWidgets
         LiveKit::livekit
 )
 

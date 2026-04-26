@@ -117,6 +117,10 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
     return;
   }
 
+  if (frameInFlight_.exchange(true)) {
+    return; // previous frame not yet consumed — drop this one
+  }
+
   const QImage view(frame.data(), frame.width(), frame.height(),
                     QImage::Format_RGBA8888);
   const QImage copied = view.copy();

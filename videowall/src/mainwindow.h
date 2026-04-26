@@ -10,9 +10,9 @@ class QLabel;
 class QPushButton;
 class QTextEdit;
 class QWidget;
-class QImage;
 
 class LiveKitPlayer;
+class VideoCell;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -25,7 +25,6 @@ private slots:
   void parseJsonInput();
   void startPlayback();
   void stopPlayback();
-  void onFrameReady(int index, const QImage &frame);
   void onStatusChanged(const QString &status);
   void onError(const QString &errorMessage);
 
@@ -42,7 +41,7 @@ private:
 
   QWidget *videoGridWidget_{nullptr};
   QGridLayout *videoGrid_{nullptr};
-  QVector<QLabel*> videoLabels_;
+  QVector<VideoCell*> videoCells_;
   QVector<LiveKitPlayer*> players_;
   QVector<QPair<QString, QString>> streams_; // {token, apiUrl}
 };

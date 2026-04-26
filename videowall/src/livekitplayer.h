@@ -20,6 +20,7 @@ public:
 
   void startPlayback(const QString &apiUrl, const QString &token);
   void stopPlayback();
+  void clearFrameInFlight() { frameInFlight_.store(false); }
 
 signals:
   void frameReady(const QImage &frame);
@@ -50,6 +51,7 @@ private:
   std::unique_ptr<livekit::Room> room_;
   std::thread worker_;
   std::atomic_bool stopRequested_{false};
+  std::atomic_bool frameInFlight_{false};
   std::string activeParticipantIdentity_;
   std::string activeTrackName_;
 
