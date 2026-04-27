@@ -54,6 +54,7 @@ private:
   std::atomic_bool frameInFlight_{false};
   std::string activeParticipantIdentity_;
   std::string activeTrackName_;
+  QImage frameBuffer_;
 
   static std::atomic_bool sdkInitialized_;
 };

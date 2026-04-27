@@ -1,5 +1,6 @@
 #include "livekitplayer.h"
 
+#include <cstring>
 #include <mutex>
 
 namespace {
@@ -121,10 +122,13 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
     return; // previous frame not yet consumed — drop this one
   }
 
-  const QImage view(frame.data(), frame.width(), frame.height(),
-                    QImage::Format_RGBA8888);
-  const QImage copied = view.copy();
-  emit frameReady(copied);
+  if (frameBuffer_.width() != frame.width() || frameBuffer_.height() != frame.height())
+    frameBuffer_ = QImage(frame.width(), frame.height(), QImage::Format_RGBA8888);
+
+  std::memcpy(frameBuffer_.bits(), frame.data(),
+              static_cast<std::size_t>(frame.width() * frame.height() * 4));
+
+  emit frameReady(frameBuffer_);
 }
 
 void LiveKitPlayer::connectWorker(QString apiUrl, QString token) {
