@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug livekit_qt_player (CodeLLDB)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/livekit_qt_player",
+      "cwd": "${workspaceFolder}",
+      "args": [],
+      "stopOnEntry": false
+    }
+  ]
+}

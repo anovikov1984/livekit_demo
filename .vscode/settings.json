@@ -1,0 +1,9 @@
+{
+  "clangd.checkUpdates": false,
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}/build"
+  ],
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "C_Cpp.autocomplete": "disabled",
+  "C_Cpp.errorSquiggles": "disabled"
+}
