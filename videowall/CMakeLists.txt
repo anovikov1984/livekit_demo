@@ -20,8 +20,9 @@ add_executable(videowall
     src/mainwindow.h
     src/livekitplayer.cpp
     src/livekitplayer.h
-    src/videocell.cpp
-    src/videocell.h
+    src/videowall.cpp
+    src/videowall.h
+    src/yuvframe.h
 )
 
 target_link_libraries(videowall

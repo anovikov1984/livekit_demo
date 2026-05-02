@@ -5,11 +5,32 @@
 
 namespace {
 constexpr int kMinFrameDimension = 1;
+
+void copyPlane(QImage &dst, const livekit::VideoPlaneInfo &src,
+               int planeW, int planeH) {
+  const std::uint8_t *srcPtr =
+      reinterpret_cast<const std::uint8_t *>(src.data_ptr);
+  std::uint8_t *dstPtr = dst.bits();
+  const int dstStride = dst.bytesPerLine();
+  const int srcStride = static_cast<int>(src.stride);
+  if (srcStride == dstStride && srcStride == planeW) {
+    std::memcpy(dstPtr, srcPtr, static_cast<std::size_t>(planeW) * planeH);
+  } else {
+    for (int row = 0; row < planeH; ++row) {
+      std::memcpy(dstPtr + row * dstStride, srcPtr + row * srcStride,
+                  static_cast<std::size_t>(planeW));
+    }
+  }
 }
+} // namespace
 
 std::atomic_bool LiveKitPlayer::sdkInitialized_{false};
 
-LiveKitPlayer::LiveKitPlayer(QObject *parent) : QObject(parent) {}
+LiveKitPlayer::LiveKitPlayer(QObject *parent) : QObject(parent) {
+  static std::once_flag metaTypeFlag;
+  std::call_once(metaTypeFlag,
+                 []() { qRegisterMetaType<YuvFrame>("YuvFrame"); });
+}
 
 LiveKitPlayer::~LiveKitPlayer() {
   stopPlayback();
@@ -47,7 +68,7 @@ void LiveKitPlayer::onTrackSubscribed(
 
   livekit::VideoStream::Options options;
   options.capacity = 2;
-  options.format = livekit::VideoBufferType::RGBA;
+  options.format = livekit::VideoBufferType::I420;
 
   const std::string participantIdentity = event.participant->identity();
   const std::string trackName = event.track->name();
@@ -113,22 +134,44 @@ void LiveKitPlayer::clearActiveVideoCallbackLocked() {
 }
 
 void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
-  if (frame.width() < kMinFrameDimension || frame.height() < kMinFrameDimension ||
-      frame.data() == nullptr) {
+  if (frame.width() < kMinFrameDimension ||
+      frame.height() < kMinFrameDimension || frame.data() == nullptr) {
     return;
+  }
+  if (frame.type() != livekit::VideoBufferType::I420) {
+    return; // we requested I420; ignore anything else
   }
 
   if (frameInFlight_.exchange(true)) {
     return; // previous frame not yet consumed — drop this one
   }
 
-  if (frameBuffer_.width() != frame.width() || frameBuffer_.height() != frame.height())
-    frameBuffer_ = QImage(frame.width(), frame.height(), QImage::Format_RGBA8888);
+  const auto planes = frame.planeInfos();
+  if (planes.size() < 3) {
+    frameInFlight_.store(false);
+    return;
+  }
 
-  std::memcpy(frameBuffer_.bits(), frame.data(),
-              static_cast<std::size_t>(frame.width() * frame.height() * 4));
+  YuvFrame &buf = frameBuffers_[writeIdx_];
+  const int w = frame.width();
+  const int h = frame.height();
+  const int cw = w / 2;
+  const int ch = h / 2;
 
-  emit frameReady(frameBuffer_);
+  if (buf.y.width() != w || buf.y.height() != h)
+    buf.y = QImage(w, h, QImage::Format_Grayscale8);
+  if (buf.u.width() != cw || buf.u.height() != ch) {
+    buf.u = QImage(cw, ch, QImage::Format_Grayscale8);
+    buf.v = QImage(cw, ch, QImage::Format_Grayscale8);
+  }
+
+  copyPlane(buf.y, planes[0], w, h);
+  copyPlane(buf.u, planes[1], cw, ch);
+  copyPlane(buf.v, planes[2], cw, ch);
+
+  emit frameReady(buf);
+
+  writeIdx_ = (writeIdx_ + 1) % static_cast<int>(frameBuffers_.size());
 }
 
 void LiveKitPlayer::connectWorker(QString apiUrl, QString token) {

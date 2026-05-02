@@ -1,8 +1,7 @@
 #include "mainwindow.h"
 #include "livekitplayer.h"
-#include "videocell.h"
+#include "videowall.h"
 
-#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -13,7 +12,6 @@
 #include <QTextEdit>
 #include <QVBoxLayout>
 #include <QWidget>
-#include <cmath>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   createUi();
@@ -65,17 +63,18 @@ void MainWindow::startPlayback() {
   }
 
   clearPlayers();
-  rebuildGrid();
+  videoWall_->setStreamCount(streams_.size());
   setButtonStates(true);
 
   for (int i = 0; i < streams_.size(); ++i) {
     auto *player = new LiveKitPlayer(this);
-    VideoCell *cell = videoCells_[i];
+    VideoWall *wall = videoWall_;
 
-    connect(player, &LiveKitPlayer::frameReady, this, [player, cell](const QImage &frame) {
-      player->clearFrameInFlight();
-      cell->uploadFrame(frame);
-    });
+    connect(player, &LiveKitPlayer::frameReady, this,
+            [player, wall, i](const YuvFrame &frame) {
+              player->clearFrameInFlight();
+              wall->uploadFrame(i, frame);
+            });
     connect(player, &LiveKitPlayer::statusChanged, this, &MainWindow::onStatusChanged);
     connect(player, &LiveKitPlayer::errorOccurred, this, &MainWindow::onError);
 
@@ -88,9 +87,7 @@ void MainWindow::stopPlayback() {
   clearPlayers();
   setButtonStates(false);
   statusLabel_->setText(QStringLiteral("Stopped"));
-  for (auto *cell : videoCells_) {
-    cell->clearFrame();
-  }
+  videoWall_->clearAll();
 }
 
 void MainWindow::onStatusChanged(const QString &status) {
@@ -108,23 +105,6 @@ void MainWindow::clearPlayers() {
     delete player;
   }
   players_.clear();
-}
-
-void MainWindow::rebuildGrid() {
-  for (auto *cell : videoCells_) {
-    videoGrid_->removeWidget(cell);
-    delete cell;
-  }
-  videoCells_.clear();
-
-  const int n = streams_.size();
-  const int cols = static_cast<int>(std::ceil(std::sqrt(n)));
-
-  for (int i = 0; i < n; ++i) {
-    auto *cell = new VideoCell(videoGridWidget_);
-    videoGrid_->addWidget(cell, i / cols, i % cols);
-    videoCells_.append(cell);
-  }
 }
 
 void MainWindow::createUi() {
@@ -152,23 +132,15 @@ void MainWindow::createUi() {
   connect(playButton_, &QPushButton::clicked, this, &MainWindow::startPlayback);
   connect(stopButton_, &QPushButton::clicked, this, &MainWindow::stopPlayback);
 
-  videoGridWidget_ = new QWidget(centralWidget);
-  videoGridWidget_->setStyleSheet(QStringLiteral("background-color: black;"));
-  videoGrid_ = new QGridLayout(videoGridWidget_);
-  videoGrid_->setSpacing(4);
-  videoGrid_->setContentsMargins(0, 0, 0, 0);
-
-  // Placeholder cell until Play is pressed
-  auto *placeholder = new VideoCell(videoGridWidget_);
-  videoGrid_->addWidget(placeholder, 0, 0);
-  videoCells_.append(placeholder);
+  videoWall_ = new VideoWall(centralWidget);
+  videoWall_->setStreamCount(1);
 
   statusLabel_ = new QLabel(QStringLiteral("Idle"), centralWidget);
 
   mainLayout->addWidget(jsonLabel);
   mainLayout->addWidget(jsonEdit_);
   mainLayout->addLayout(buttonsLayout);
-  mainLayout->addWidget(videoGridWidget_, 1);
+  mainLayout->addWidget(videoWall_, 1);
   mainLayout->addWidget(statusLabel_);
 
   setCentralWidget(centralWidget);

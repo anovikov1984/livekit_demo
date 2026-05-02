@@ -4,12 +4,14 @@
 #include <QObject>
 #include <QString>
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
 #include <thread>
 
 #include "livekit/livekit.h"
+#include "yuvframe.h"
 
 class LiveKitPlayer : public QObject, public livekit::RoomDelegate {
   Q_OBJECT
@@ -23,7 +25,7 @@ public:
   void clearFrameInFlight() { frameInFlight_.store(false); }
 
 signals:
-  void frameReady(const QImage &frame);
+  void frameReady(const YuvFrame &frame);
   void statusChanged(const QString &status);
   void errorOccurred(const QString &errorMessage);
 
@@ -54,7 +56,9 @@ private:
   std::atomic_bool frameInFlight_{false};
   std::string activeParticipantIdentity_;
   std::string activeTrackName_;
-  QImage frameBuffer_;
+  // Triple-buffered I420 frames to avoid QImage COW detach.
+  std::array<YuvFrame, 3> frameBuffers_;
+  int writeIdx_{0};
 
   static std::atomic_bool sdkInitialized_;
 };
