@@ -48,6 +48,23 @@ const GLfloat kVerts[] = {
      1.0f,  1.0f, 1.0f, 0.0f,
 };
 
+QRect letterboxRect(QRect cell, int srcW, int srcH) {
+  if (srcW <= 0 || srcH <= 0) return cell;
+  const float cellAspect = static_cast<float>(cell.width()) / cell.height();
+  const float srcAspect  = static_cast<float>(srcW) / srcH;
+  int w, h;
+  if (srcAspect > cellAspect) {
+    w = cell.width();
+    h = static_cast<int>(cell.width() / srcAspect);
+  } else {
+    h = cell.height();
+    w = static_cast<int>(cell.height() * srcAspect);
+  }
+  return QRect(cell.x() + (cell.width() - w) / 2,
+               cell.y() + (cell.height() - h) / 2,
+               w, h);
+}
+
 } // namespace
 
 VideoWall::VideoWall(QWidget *parent) : QOpenGLWidget(parent) {
@@ -226,7 +243,7 @@ void VideoWall::paintGL() {
 
     if (!s.hasFrame) continue;
 
-    const QRect r = cellRect(i);
+    const QRect r = letterboxRect(cellRect(i), s.yW, s.yH);
     glViewport(r.x(), r.y(), r.width(), r.height());
 
     glActiveTexture(GL_TEXTURE0);
