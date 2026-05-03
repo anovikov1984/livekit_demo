@@ -1,0 +1,77 @@
+# Build the LiveKit C++ SDK base image. Run once, then push to a registry.
+#
+# Usage:
+#   docker build -t ghcr.io/YOUR_USERNAME/livekit-sdk-base:latest -f Dockerfile.sdk .
+#   docker push ghcr.io/YOUR_USERNAME/livekit-sdk-base:latest
+
+FROM ubuntu:24.04
+
+ARG LIVEKIT_REPO=https://github.com/Shushpancheak/client-sdk-cpp.git
+ARG LIVEKIT_COMMIT=add-remote-video-quality-controls
+ARG BUILD_TYPE=RelWithDebInfo
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig
+ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig
+ENV PKG_CONFIG_PATH_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig
+ENV PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig
+ENV CARGO_BUILD_JOBS=2
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    curl \
+    git \
+    ninja-build \
+    pkg-config \
+    protobuf-compiler \
+    clang \
+    libclang-dev \
+    qt6-base-dev \
+    libgl-dev \
+    libssl-dev \
+    libglib2.0-dev \
+    libasound2-dev \
+    libpulse-dev \
+    libdrm-dev \
+    libgbm-dev \
+    libva-dev \
+    libx11-dev \
+    libxcomposite-dev \
+    libxdamage-dev \
+    libxext-dev \
+    libxfixes-dev \
+    libxrandr-dev \
+    libxtst-dev \
+    libnss3-dev \
+    libnspr4-dev \
+    libpipewire-0.3-dev \
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /workspace
+
+RUN git clone --recurse-submodules "$LIVEKIT_REPO" .deps/client-sdk-cpp \
+ && cd .deps/client-sdk-cpp \
+ && git fetch --all --tags \
+ && git checkout "$LIVEKIT_COMMIT" \
+ && git submodule update --init --recursive
+
+RUN COMMON="-O2 -g -DNDEBUG -fno-omit-frame-pointer" \
+ && cmake -S .deps/client-sdk-cpp -B .deps/client-sdk-cpp/build \
+      -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+      -DCMAKE_INSTALL_PREFIX=/workspace/.deps/client-sdk-cpp/install \
+      -DBUILD_SHARED_LIBS=ON \
+      "-DCMAKE_C_FLAGS_RELWITHDEBINFO=$COMMON" \
+      "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=$COMMON" \
+ && cmake --build .deps/client-sdk-cpp/build --parallel "${JOBS:-4}" \
+ && cmake --install .deps/client-sdk-cpp/build
+
+RUN mkdir -p third_party/livekit-sdk/lib third_party/livekit-sdk/include \
+ && cp -P .deps/client-sdk-cpp/install/lib/liblivekit*.so* third_party/livekit-sdk/lib/ \
+ && cp -R .deps/client-sdk-cpp/install/lib/cmake third_party/livekit-sdk/lib/ \
+ && cp -R .deps/client-sdk-cpp/install/include/livekit third_party/livekit-sdk/include/ \
+ && rm -rf .deps/client-sdk-cpp/build .deps/client-sdk-cpp/client-sdk-rust/target

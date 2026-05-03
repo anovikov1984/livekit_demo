@@ -57,6 +57,9 @@ if [[ "${INSTALL_DEPS:-0}" == "1" ]]; then
     curl https://sh.rustup.rs -sSf | sh -s -- -y
     # shellcheck disable=SC1090
     source "$HOME/.cargo/env"
+  else
+    echo "Updating Rust toolchain..."
+    rustup update stable
   fi
 
   if ! command -v protoc >/dev/null 2>&1; then
