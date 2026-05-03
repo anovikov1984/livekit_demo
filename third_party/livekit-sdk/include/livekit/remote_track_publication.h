@@ -18,16 +18,28 @@
 
 #include "livekit/track_publication.h"
 
+#include <cstdint>
+
 namespace livekit {
 
 namespace proto {
 class OwnedTrackPublication;
 }
 
+enum class RemoteVideoQuality {
+  Low,
+  Medium,
+  High,
+};
+
 class Track;
 
 class RemoteTrackPublication : public TrackPublication {
 public:
+  void setEnabled(bool enabled);
+void setVideoDimensions(std::uint32_t width, std::uint32_t height);
+void setVideoQuality(RemoteVideoQuality quality);
+
   /// Note, this RemoteTrackPublication is constructed internally only;
   /// safe to accept proto::OwnedTrackPublication.
   explicit RemoteTrackPublication(const proto::OwnedTrackPublication &owned);

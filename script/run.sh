@@ -25,7 +25,7 @@ set -euo pipefail
 #   INSTALL_DEPS=1
 
 LIVEKIT_COMMIT=add-remote-video-quality-controls
-LIVEKIT_REPO="${LIVEKIT_REPO:-git@github.com:Shushpancheak/client-sdk-cpp.git}"
+LIVEKIT_REPO="${LIVEKIT_REPO:-git@github.com:CMAK12/client-sdk-cpp.git}"
 BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
 ARCH="${ARCH:-$(uname -m)}"
 JOBS="${JOBS:-$(sysctl -n hw.logicalcpu)}"

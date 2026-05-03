@@ -25,6 +25,13 @@ void copyPlane(QImage &dst, const livekit::VideoPlaneInfo &src,
 } // namespace
 
 std::atomic_bool LiveKitPlayer::sdkInitialized_{false};
+std::atomic<int> LiveKitPlayer::requestedWidth_{0};
+std::atomic<int> LiveKitPlayer::requestedHeight_{0};
+
+void LiveKitPlayer::setRequestedDimensions(int width, int height) {
+  requestedWidth_.store(width > 0 ? width : 0);
+  requestedHeight_.store(height > 0 ? height : 0);
+}
 
 LiveKitPlayer::LiveKitPlayer(QObject *parent) : QObject(parent) {
   static std::once_flag metaTypeFlag;
@@ -65,6 +72,27 @@ void LiveKitPlayer::onTrackSubscribed(
       event.participant == nullptr) {
     return;
   }
+
+  if (event.publication) {
+    emit statusChanged(QStringLiteral(
+        "Publication: sid=%1, simulcast=%2, published=%3x%4, mime=%5")
+        .arg(QString::fromStdString(event.publication->sid()))
+        .arg(event.publication->simulcasted() ? "true" : "false")
+        .arg(event.publication->width())
+        .arg(event.publication->height())
+        .arg(QString::fromStdString(event.publication->mimeType())));
+
+    const int reqW = requestedWidth_.load();
+    const int reqH = requestedHeight_.load();
+    if (reqW > 0 && reqH > 0) {
+      event.publication->setVideoQuality(livekit::RemoteVideoQuality::Low);
+      event.publication->setVideoDimensions(
+          static_cast<std::uint32_t>(reqW), static_cast<std::uint32_t>(reqH));
+      emit statusChanged(
+          QStringLiteral("Requested video dimensions: %1x%2").arg(reqW).arg(reqH));
+    }
+  }
+
 
   livekit::VideoStream::Options options;
   options.capacity = 2;
@@ -170,6 +198,10 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
   copyPlane(buf.v, planes[2], cw, ch);
 
   emit frameReady(buf);
+
+  emit statusChanged(QStringLiteral("Receiving %1x%2")
+                         .arg(frame.width())
+                         .arg(frame.height()));
 
   writeIdx_ = (writeIdx_ + 1) % static_cast<int>(frameBuffers_.size());
 }

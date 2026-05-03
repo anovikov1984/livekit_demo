@@ -24,6 +24,12 @@ public:
   void stopPlayback();
   void clearFrameInFlight() { frameInFlight_.store(false); }
 
+  // Process-wide override for the dimensions requested via
+  // RemoteTrackPublication::setVideoDimensions on each new subscription.
+  // Set once at startup (e.g. from main()) — applies to all subsequent
+  // onTrackSubscribed callbacks. (0, 0) means "don't override".
+  static void setRequestedDimensions(int width, int height);
+
 signals:
   void frameReady(const YuvFrame &frame);
   void statusChanged(const QString &status);
@@ -61,4 +67,6 @@ private:
   int writeIdx_{0};
 
   static std::atomic_bool sdkInitialized_;
+  static std::atomic<int> requestedWidth_;
+  static std::atomic<int> requestedHeight_;
 };
