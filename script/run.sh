@@ -8,12 +8,12 @@ set -euo pipefail
 #   livekit_demo/
 #     videowall/
 #     third_party/livekit-sdk/
-#     scripts/rebuild_livekit_sdk_and_app.sh
+#     scripts/run.sh
 #
 # Usage:
 #
-#   chmod +x scripts/rebuild_livekit_sdk_and_app.sh
-#   ./scripts/rebuild_livekit_sdk_and_app.sh
+#   chmod +x scripts/run.sh
+#   ./scripts/run.sh
 #
 # Optional env vars:
 #
@@ -25,7 +25,7 @@ set -euo pipefail
 #   INSTALL_DEPS=1
 
 LIVEKIT_COMMIT=add-remote-video-quality-controls
-LIVEKIT_REPO="${LIVEKIT_REPO:-git@github.com:CMAK12/client-sdk-cpp.git}"
+LIVEKIT_REPO="${LIVEKIT_REPO:-git@github.com:Shushpancheak/client-sdk-cpp.git}"
 BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
 ARCH="${ARCH:-$(uname -m)}"
 JOBS="${JOBS:-$(sysctl -n hw.logicalcpu)}"
@@ -95,7 +95,11 @@ cd "$SDK_SRC_DIR"
 
 echo "Checking out LiveKit commit $LIVEKIT_COMMIT..."
 git fetch --all --tags
-git checkout "$LIVEKIT_COMMIT"
+if ! git checkout "$LIVEKIT_COMMIT" 2>/dev/null; then
+  echo "ERROR: branch/tag/commit '$LIVEKIT_COMMIT' not found in $LIVEKIT_REPO"
+  echo "Set LIVEKIT_COMMIT to a valid branch, tag, or SHA and retry."
+  exit 1
+fi
 git submodule update --init --recursive
 
 if [[ "${CLEAN:-0}" == "1" ]]; then
