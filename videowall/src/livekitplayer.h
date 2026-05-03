@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -34,6 +35,7 @@ signals:
   void frameReady(const YuvFrame &frame);
   void statusChanged(const QString &status);
   void errorOccurred(const QString &errorMessage);
+  void mimeTypeReceived(const std::string &mime);
 
 protected:
   void onTrackSubscribed(livekit::Room &room,
@@ -65,6 +67,10 @@ private:
   // Triple-buffered I420 frames to avoid QImage COW detach.
   std::array<YuvFrame, 3> frameBuffers_;
   int writeIdx_{0};
+
+  // FPS tracking — sampled ~1 Hz in emitFrameFromLiveKit.
+  int fpsFrameCount_{0};
+  std::chrono::steady_clock::time_point fpsWindowStart_{};
 
   static std::atomic_bool sdkInitialized_;
   static std::atomic<int> requestedWidth_;

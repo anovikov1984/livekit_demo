@@ -82,6 +82,8 @@ void LiveKitPlayer::onTrackSubscribed(
         .arg(event.publication->height())
         .arg(QString::fromStdString(event.publication->mimeType())));
 
+    emit mimeTypeReceived(event.publication->mimeType());
+
     const int reqW = requestedWidth_.load();
     const int reqH = requestedHeight_.load();
     if (reqW > 0 && reqH > 0) {
@@ -199,9 +201,18 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
 
   emit frameReady(buf);
 
-  emit statusChanged(QStringLiteral("Receiving %1x%2")
-                         .arg(frame.width())
-                         .arg(frame.height()));
+  ++fpsFrameCount_;
+  const auto now = std::chrono::steady_clock::now();
+  const auto elapsed = std::chrono::duration<double>(now - fpsWindowStart_).count();
+  if (elapsed >= 1.0) {
+    const double fps = fpsFrameCount_ / elapsed;
+    fpsFrameCount_ = 0;
+    fpsWindowStart_ = now;
+    emit statusChanged(QStringLiteral("Receiving %1x%2 @ %3 fps")
+                           .arg(frame.width())
+                           .arg(frame.height())
+                           .arg(fps, 0, 'f', 1));
+  }
 
   writeIdx_ = (writeIdx_ + 1) % static_cast<int>(frameBuffers_.size());
 }

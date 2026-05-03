@@ -75,6 +75,8 @@ void MainWindow::startPlayback() {
               player->clearFrameInFlight();
               wall->uploadFrame(i, frame);
             });
+    connect(player, &LiveKitPlayer::mimeTypeReceived, this,
+            [wall, i](const std::string &mime) { wall->setSlotMime(i, mime); });
     connect(player, &LiveKitPlayer::statusChanged, this, &MainWindow::onStatusChanged);
     connect(player, &LiveKitPlayer::errorOccurred, this, &MainWindow::onError);
 

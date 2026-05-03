@@ -6,6 +6,8 @@
 #include <QOpenGLWidget>
 #include <QRect>
 
+#include <chrono>
+#include <string>
 #include <vector>
 
 #include "yuvframe.h"
@@ -25,6 +27,7 @@ public:
   void uploadFrame(int idx, const YuvFrame &frame);
   void clearFrame(int idx);
   void clearAll();
+  void setSlotMime(int idx, const std::string &mime);
 
 protected:
   void initializeGL() override;
@@ -44,6 +47,9 @@ private:
     int vH{0};
     bool hasFrame{false};
     YuvFrame pending;
+    std::string mime;
+    std::chrono::steady_clock::time_point lastFrameTime{};
+    bool firstFrame{true};
   };
 
   void reconcileSlots();

@@ -3,7 +3,9 @@
 #include <QImage>
 #include <QOpenGLShaderProgram>
 #include <QSizePolicy>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 
 namespace {
 
@@ -122,6 +124,11 @@ void VideoWall::clearAll() {
   update();
 }
 
+void VideoWall::setSlotMime(int idx, const std::string &mime) {
+  if (idx < 0 || idx >= static_cast<int>(slots_.size())) return;
+  slots_[idx].mime = mime;
+}
+
 void VideoWall::initializeGL() {
   initializeOpenGLFunctions();
 
@@ -238,6 +245,19 @@ void VideoWall::paintGL() {
       uploadPlane(s.texU, s.pending.u, s.uW, s.uH);
       uploadPlane(s.texV, s.pending.v, s.vW, s.vH);
       s.hasFrame = true;
+
+      const auto now = std::chrono::steady_clock::now();
+      double fps = 0.0;
+      if (!s.firstFrame) {
+        const double dt = std::chrono::duration<double>(now - s.lastFrameTime).count();
+        fps = dt > 0.0 ? 1.0 / dt : 0.0;
+      }
+      s.lastFrameTime = now;
+      s.firstFrame = false;
+      fprintf(stderr, "[stream %d] %dx%d @ %.1f fps  mime=%s\n",
+              i, s.yW, s.yH, fps,
+              s.mime.empty() ? "unknown" : s.mime.c_str());
+
       s.pending = YuvFrame{};
     }
 
