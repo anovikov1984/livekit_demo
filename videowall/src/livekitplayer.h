@@ -1,10 +1,9 @@
 #pragma once
 
-#include <QImage>
+#include <QJsonObject>
 #include <QObject>
 #include <QString>
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -12,7 +11,11 @@
 #include <thread>
 
 #include "livekit/livekit.h"
+#include "yuvbufferpool.h"
 #include "yuvframe.h"
+
+class QNetworkAccessManager;
+class QNetworkReply;
 
 class LiveKitPlayer : public QObject, public livekit::RoomDelegate {
   Q_OBJECT
@@ -21,7 +24,9 @@ public:
   explicit LiveKitPlayer(QObject *parent = nullptr);
   ~LiveKitPlayer() override;
 
-  void startPlayback(const QString &apiUrl, const QString &token);
+  // Fetch a LiveKit token via the create-token API using the given Bearer JWT
+  // and camera descriptor body, then connect (wss first, https fallback).
+  void startPlayback(const QString &bearerJwt, const QJsonObject &descriptor);
   void stopPlayback();
   void clearFrameInFlight() { frameInFlight_.store(false); }
 
@@ -54,7 +59,8 @@ protected:
 private:
   void clearActiveVideoCallbackLocked();
   void emitFrameFromLiveKit(const livekit::VideoFrame &frame);
-  void connectWorker(QString apiUrl, QString token);
+  void onTokenReply(QNetworkReply *reply);
+  void connectWorker(QString wssUrl, QString httpsUrl, QString token);
   static QString connectionStateToString(livekit::ConnectionState state);
 
   std::mutex mutex_;
@@ -64,13 +70,18 @@ private:
   std::atomic_bool frameInFlight_{false};
   std::string activeParticipantIdentity_;
   std::string activeTrackName_;
-  // Triple-buffered I420 frames to avoid QImage COW detach.
-  std::array<YuvFrame, 3> frameBuffers_;
-  int writeIdx_{0};
 
   // FPS tracking — sampled ~1 Hz in emitFrameFromLiveKit.
   int fpsFrameCount_{0};
   std::chrono::steady_clock::time_point fpsWindowStart_{};
+
+  // Plane-buffer recycler. Per-frame plane allocations come from here so we
+  // amortize the heap churn at 30 fps × 3 planes per stream.
+  std::shared_ptr<YuvBufferPool> framePool_{std::make_shared<YuvBufferPool>()};
+
+  // HTTP token fetch (lives on the GUI thread).
+  QNetworkAccessManager *nam_{nullptr};
+  QNetworkReply *currentReply_{nullptr};
 
   static std::atomic_bool sdkInitialized_;
   static std::atomic<int> requestedWidth_;

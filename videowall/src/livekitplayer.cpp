@@ -1,23 +1,47 @@
 #include "livekitplayer.h"
 
+#include <QJsonDocument>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QUrl>
+
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
 namespace {
+constexpr const char *kCreateTokenUrl =
+    "https://api-staging.lumix.ai/v1/live-view/lwebrtc/create-token/"
+    "65687f0364d1bb3b7b207c5c/6953cff92a13ade0364679ec/"
+    "6953ecc355947949135d3e08";
+
+QString httpsToWss(const QString &url) {
+  if (url.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)) {
+    return QStringLiteral("wss://") +
+           url.mid(QStringLiteral("https://").size());
+  }
+  if (url.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)) {
+    return QStringLiteral("ws://") +
+           url.mid(QStringLiteral("http://").size());
+  }
+  return url;
+}
+
 constexpr int kMinFrameDimension = 1;
 
-void copyPlane(QImage &dst, const livekit::VideoPlaneInfo &src,
-               int planeW, int planeH) {
+// Copy one I420 plane out of the SDK frame into a tightly-packed destination
+// buffer (stride == planeW). Used per-plane on the SDK reader thread.
+void copyPlaneTight(std::uint8_t *dst, const livekit::VideoPlaneInfo &src,
+                    int planeW, int planeH) {
   const std::uint8_t *srcPtr =
       reinterpret_cast<const std::uint8_t *>(src.data_ptr);
-  std::uint8_t *dstPtr = dst.bits();
-  const int dstStride = dst.bytesPerLine();
   const int srcStride = static_cast<int>(src.stride);
-  if (srcStride == dstStride && srcStride == planeW) {
-    std::memcpy(dstPtr, srcPtr, static_cast<std::size_t>(planeW) * planeH);
+  if (srcStride == planeW) {
+    std::memcpy(dst, srcPtr, static_cast<std::size_t>(planeW) * planeH);
   } else {
     for (int row = 0; row < planeH; ++row) {
-      std::memcpy(dstPtr + row * dstStride, srcPtr + row * srcStride,
+      std::memcpy(dst + row * planeW, srcPtr + row * srcStride,
                   static_cast<std::size_t>(planeW));
     }
   }
@@ -43,15 +67,42 @@ LiveKitPlayer::~LiveKitPlayer() {
   stopPlayback();
 }
 
-void LiveKitPlayer::startPlayback(const QString &apiUrl, const QString &token) {
+void LiveKitPlayer::startPlayback(const QString &bearerJwt,
+                                  const QJsonObject &descriptor) {
   stopPlayback();
-
   stopRequested_.store(false);
-  worker_ = std::thread(&LiveKitPlayer::connectWorker, this, apiUrl, token);
+
+  if (!nam_) {
+    nam_ = new QNetworkAccessManager(this);
+  }
+
+  emit statusChanged(QStringLiteral("Requesting LiveKit token..."));
+
+  QNetworkRequest req{QUrl(QString::fromLatin1(kCreateTokenUrl))};
+  req.setHeader(QNetworkRequest::ContentTypeHeader,
+                QStringLiteral("application/json"));
+  req.setRawHeader("Authorization",
+                   QByteArray("Bearer ") + bearerJwt.toUtf8());
+  req.setRawHeader("Accept", "application/json, text/plain, */*");
+
+  const QByteArray body =
+      QJsonDocument(descriptor).toJson(QJsonDocument::Compact);
+
+  currentReply_ = nam_->post(req, body);
+  QNetworkReply *reply = currentReply_;
+  connect(reply, &QNetworkReply::finished, this,
+          [this, reply]() { onTokenReply(reply); });
 }
 
 void LiveKitPlayer::stopPlayback() {
   stopRequested_.store(true);
+
+  if (currentReply_) {
+    currentReply_->disconnect();
+    currentReply_->abort();
+    currentReply_->deleteLater();
+    currentReply_ = nullptr;
+  }
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -66,6 +117,57 @@ void LiveKitPlayer::stopPlayback() {
   }
 }
 
+void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
+  if (reply != currentReply_) {
+    reply->deleteLater();
+    return;
+  }
+  currentReply_ = nullptr;
+  reply->deleteLater();
+
+  if (stopRequested_.load()) {
+    return;
+  }
+
+  const int httpStatus =
+      reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+  const QByteArray payload = reply->readAll();
+
+  if (reply->error() != QNetworkReply::NoError) {
+    emit errorOccurred(QStringLiteral("Token HTTP error (%1): %2 %3")
+                           .arg(httpStatus)
+                           .arg(reply->errorString())
+                           .arg(QString::fromUtf8(payload)));
+    return;
+  }
+  if (httpStatus < 200 || httpStatus >= 300) {
+    emit errorOccurred(QStringLiteral("Token HTTP %1: %2")
+                           .arg(httpStatus)
+                           .arg(QString::fromUtf8(payload)));
+    return;
+  }
+
+  QJsonParseError perr{};
+  const QJsonDocument doc = QJsonDocument::fromJson(payload, &perr);
+  if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
+    emit errorOccurred(QStringLiteral("Invalid token JSON: %1")
+                           .arg(perr.errorString()));
+    return;
+  }
+  const QJsonObject obj = doc.object();
+  const QString token = obj.value(QStringLiteral("token")).toString();
+  const QString apiUrl = obj.value(QStringLiteral("apiUrl")).toString();
+  if (token.isEmpty() || apiUrl.isEmpty()) {
+    emit errorOccurred(QStringLiteral(
+        "Token response missing 'token' or 'apiUrl'"));
+    return;
+  }
+
+  const QString wssUrl = httpsToWss(apiUrl);
+  worker_ = std::thread(&LiveKitPlayer::connectWorker, this, wssUrl, apiUrl,
+                        token);
+}
+
 void LiveKitPlayer::onTrackSubscribed(
     livekit::Room &room, const livekit::TrackSubscribedEvent &event) {
   if (!event.track || event.track->kind() != livekit::TrackKind::KIND_VIDEO ||
@@ -74,6 +176,13 @@ void LiveKitPlayer::onTrackSubscribed(
   }
 
   if (event.publication) {
+    fprintf(stderr,
+            "[publication] sid=%s simulcast=%s published=%ux%u mime=%s\n",
+            event.publication->sid().c_str(),
+            event.publication->simulcasted() ? "true" : "false",
+            event.publication->width(), event.publication->height(),
+            event.publication->mimeType().c_str());
+
     emit statusChanged(QStringLiteral(
         "Publication: sid=%1, simulcast=%2, published=%3x%4, mime=%5")
         .arg(QString::fromStdString(event.publication->sid()))
@@ -182,24 +291,26 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
     return;
   }
 
-  YuvFrame &buf = frameBuffers_[writeIdx_];
   const int w = frame.width();
   const int h = frame.height();
   const int cw = w / 2;
   const int ch = h / 2;
 
-  if (buf.y.width() != w || buf.y.height() != h)
-    buf.y = QImage(w, h, QImage::Format_Grayscale8);
-  if (buf.u.width() != cw || buf.u.height() != ch) {
-    buf.u = QImage(cw, ch, QImage::Format_Grayscale8);
-    buf.v = QImage(cw, ch, QImage::Format_Grayscale8);
-  }
+  auto y = framePool_->acquire(static_cast<std::size_t>(w) * h);
+  auto u = framePool_->acquire(static_cast<std::size_t>(cw) * ch);
+  auto v = framePool_->acquire(static_cast<std::size_t>(cw) * ch);
 
-  copyPlane(buf.y, planes[0], w, h);
-  copyPlane(buf.u, planes[1], cw, ch);
-  copyPlane(buf.v, planes[2], cw, ch);
+  copyPlaneTight(y->data(), planes[0], w, h);
+  copyPlaneTight(u->data(), planes[1], cw, ch);
+  copyPlaneTight(v->data(), planes[2], cw, ch);
 
-  emit frameReady(buf);
+  YuvFrame out{
+      std::const_pointer_cast<const std::vector<std::uint8_t>>(std::move(y)),
+      std::const_pointer_cast<const std::vector<std::uint8_t>>(std::move(u)),
+      std::const_pointer_cast<const std::vector<std::uint8_t>>(std::move(v)),
+      w, h};
+
+  emit frameReady(out);
 
   ++fpsFrameCount_;
   const auto now = std::chrono::steady_clock::now();
@@ -213,13 +324,10 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
                            .arg(frame.height())
                            .arg(fps, 0, 'f', 1));
   }
-
-  writeIdx_ = (writeIdx_ + 1) % static_cast<int>(frameBuffers_.size());
 }
 
-void LiveKitPlayer::connectWorker(QString apiUrl, QString token) {
-  emit statusChanged(QStringLiteral("Connecting to LiveKit..."));
-
+void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
+                                  QString token) {
   static std::once_flag sdkInitFlag;
   std::call_once(sdkInitFlag, []() {
     if (livekit::initialize(livekit::LogLevel::Info, livekit::LogSink::kConsole)) {
@@ -227,18 +335,32 @@ void LiveKitPlayer::connectWorker(QString apiUrl, QString token) {
     }
   });
 
-  auto room = std::make_unique<livekit::Room>();
-  room->setDelegate(this);
-
   livekit::RoomOptions options;
   options.auto_subscribe = true;
   options.dynacast = false;
 
-  const bool connected =
-      room->Connect(apiUrl.toStdString(), token.toStdString(), options);
+  auto tryConnect = [&](const QString &url) -> std::unique_ptr<livekit::Room> {
+    if (stopRequested_.load()) return nullptr;
+    emit statusChanged(QStringLiteral("Connecting to LiveKit at %1...").arg(url));
+    auto room = std::make_unique<livekit::Room>();
+    room->setDelegate(this);
+    const bool ok =
+        room->Connect(url.toStdString(), token.toStdString(), options);
+    if (!ok) return nullptr;
+    return room;
+  };
 
-  if (!connected) {
-    emit errorOccurred(QStringLiteral("Failed to connect to LiveKit room"));
+  auto room = tryConnect(wssUrl);
+  if (!room && !stopRequested_.load() && wssUrl != httpsUrl) {
+    emit statusChanged(
+        QStringLiteral("wss connect failed; retrying https..."));
+    room = tryConnect(httpsUrl);
+  }
+
+  if (!room) {
+    if (!stopRequested_.load()) {
+      emit errorOccurred(QStringLiteral("Failed to connect to LiveKit room"));
+    }
     return;
   }
 

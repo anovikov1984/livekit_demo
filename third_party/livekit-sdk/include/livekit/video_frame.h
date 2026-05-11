@@ -18,10 +18,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
 namespace livekit {
+
+class FfiHandle;
 
 // Mirror of WebRTC video buffer type
 enum class VideoBufferType {
@@ -79,9 +82,18 @@ public:
   int height() const noexcept { return height_; }
   VideoBufferType type() const noexcept { return type_; }
 
-  std::uint8_t *data() noexcept { return data_.data(); }
-  const std::uint8_t *data() const noexcept { return data_.data(); }
-  std::size_t dataSize() const noexcept { return data_.size(); }
+  // In view mode (frame produced by VideoStream::fromOwnedInfoView), the
+  // backing buffer is owned by the FFI handle and is conceptually
+  // read-only; non-const data() returns nullptr in that mode.
+  std::uint8_t *data() noexcept {
+    return ffi_handle_ ? nullptr : data_.data();
+  }
+  const std::uint8_t *data() const noexcept {
+    return ffi_handle_ ? view_ptr_ : data_.data();
+  }
+  std::size_t dataSize() const noexcept {
+    return ffi_handle_ ? view_size_ : data_.size();
+  }
 
   /**
    * Compute plane layout for this frame (Y/U/V, UV, etc.), in terms of
@@ -124,11 +136,23 @@ protected:
   // should construct frames directly from FFI buffers.
   static VideoFrame fromOwnedInfo(const proto::OwnedVideoBuffer &owned);
 
+  // View-mode factory: retains the FFI handle for the frame's lifetime
+  // and exposes plane pointers directly into the FFI-owned buffer, with
+  // no intermediate memcpy. Saves one full-frame copy per video frame.
+  static VideoFrame fromOwnedInfoView(const proto::OwnedVideoBuffer &owned);
+
 private:
   int width_;
   int height_;
   VideoBufferType type_;
   std::vector<std::uint8_t> data_;
+
+  // View-mode state. When ffi_handle_ is non-null, the frame is a view
+  // over an FFI-owned buffer; data_ is empty and view_* fields are set.
+  std::shared_ptr<FfiHandle> ffi_handle_;
+  const std::uint8_t *view_ptr_{nullptr};
+  std::size_t view_size_{0};
+  std::vector<VideoPlaneInfo> view_planes_;
 };
 
 } // namespace livekit

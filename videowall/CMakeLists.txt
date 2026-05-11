@@ -10,7 +10,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets Network)
 set(LiveKit_DIR "${CMAKE_SOURCE_DIR}/../third_party/livekit-sdk/lib/cmake/LiveKit")
 find_package(LiveKit CONFIG REQUIRED)
 
@@ -30,6 +30,7 @@ target_link_libraries(videowall
         Qt6::Widgets
         Qt6::OpenGL
         Qt6::OpenGLWidgets
+        Qt6::Network
         LiveKit::livekit
 )
 
