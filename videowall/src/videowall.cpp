@@ -5,6 +5,7 @@
 #include <QFont>
 #include <QHBoxLayout>
 #include <QPainter>
+#include <QFile>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -436,7 +437,16 @@ void VideoWall::createUi() {
   auto *bearerLabel = new QLabel(QStringLiteral("Bearer JWT:"), this);
   bearerEdit_ = new QTextEdit(this);
   bearerEdit_->setMaximumHeight(50);
-  bearerEdit_->setPlaceholderText(QStringLiteral("Paste auth0 JWT here"));
+  QFile tokenFile(QStringLiteral("token"));
+
+  if (tokenFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    QTextStream in(&tokenFile);
+    bearerEdit_->setPlainText(in.readAll().trimmed());
+    tokenFile.close();
+  } else {
+    bearerEdit_->setPlaceholderText(QStringLiteral("Failed to load ../token"));
+  }
+
   QFont monoFont = bearerEdit_->font();
   monoFont.setStyleHint(QFont::Monospace);
   monoFont.setFamily(QStringLiteral("Menlo"));
@@ -449,15 +459,15 @@ void VideoWall::createUi() {
   jsonEdit_->setMinimumHeight(80);
   jsonEdit_->setMaximumHeight(120);
   jsonEdit_->setPlainText(QStringLiteral(
-      "[\n"
-      "  {\n"
-      "    \"participantName\": \"auth0|...\",\n"
-      "    \"edgeId\": \"...\",\n"
-      "    \"cameraId\": \"...\",\n"
-      "    \"resolution\": 2,\n"
-      "    \"errorCounter\": 0\n"
-      "  }\n"
-      "]"));
+    "[\n"
+    "  {\n"
+    "    \"participantName\": \"auth0|6363bdb451bcdda4f909db23-415bf0fd-f5dc-4b3a-b543-b5cedec53a04\",\n"
+    "    \"edgeId\": \"6953cff92a13ade0364679ec\",\n"
+    "    \"cameraId\": \"6953ebd855947949135d3dfd\",\n"
+    "    \"resolution\": 3,\n"
+    "    \"errorCounter\": 0\n"
+    "  }\n"
+    "]"));
 
   auto *buttonsLayout = new QHBoxLayout();
   playButton_ = new QPushButton(QStringLiteral("Play All"), this);
