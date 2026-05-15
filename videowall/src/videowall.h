@@ -118,7 +118,10 @@ private:
   void createUi();
   void setButtonStates(bool isPlaying);
   bool parseJsonInput();
-  void clearPlayers();
+  void pauseAllPlayers();
+  void shutdownAllPlayers();
+  void ensurePlayers(int streamCount);
+  void connectPlayerSignals(int slotIndex);
 
   QWidget *fieldsWidget_{nullptr};
   QTextEdit *bearerEdit_{nullptr};

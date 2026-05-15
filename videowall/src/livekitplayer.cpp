@@ -1,6 +1,12 @@
 #include "livekitplayer.h"
 
+#include "livekit/remote_participant.h"
+#include "livekit/remote_track_publication.h"
+
+#include <QCoreApplication>
+#include <QEventLoop>
 #include <QJsonDocument>
+#include <QMetaObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -8,7 +14,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 
 namespace {
 constexpr const char *kCreateTokenUrl =
@@ -30,8 +35,6 @@ QString httpsToWss(const QString &url) {
 
 constexpr int kMinFrameDimension = 1;
 
-// Copy one I420 plane out of the SDK frame into a tightly-packed destination
-// buffer (stride == planeW). Used per-plane on the SDK reader thread.
 void copyPlaneTight(std::uint8_t *dst, const livekit::VideoPlaneInfo &src,
                     int planeW, int planeH) {
   const std::uint8_t *srcPtr =
@@ -64,13 +67,22 @@ LiveKitPlayer::LiveKitPlayer(QObject *parent) : QObject(parent) {
 }
 
 LiveKitPlayer::~LiveKitPlayer() {
-  stopPlayback();
+  shutdownPlayback();
 }
 
 void LiveKitPlayer::startPlayback(const QString &bearerJwt,
                                   const QJsonObject &descriptor) {
-  stopPlayback();
+  receivingDesired_.store(true);
   stopRequested_.store(false);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (room_) {
+      resumeReceivingLocked();
+      emit statusChanged(QStringLiteral("Resuming on existing room connection..."));
+      return;
+    }
+  }
 
   if (!nam_) {
     nam_ = new QNetworkAccessManager(this);
@@ -94,8 +106,9 @@ void LiveKitPlayer::startPlayback(const QString &bearerJwt,
           [this, reply]() { onTokenReply(reply); });
 }
 
-void LiveKitPlayer::stopPlayback() {
-  stopRequested_.store(true);
+void LiveKitPlayer::pauseReceiving() {
+  receivingDesired_.store(false);
+  frameInFlight_.store(false);
 
   if (currentReply_) {
     currentReply_->disconnect();
@@ -104,17 +117,40 @@ void LiveKitPlayer::stopPlayback() {
     currentReply_ = nullptr;
   }
 
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (room_) {
-      clearActiveVideoCallbackLocked();
-      room_.reset();
-    }
+    pauseReceivingLocked();
+  }
+
+  fpsFrameCount_ = 0;
+}
+
+void LiveKitPlayer::shutdownPlayback() {
+  receivingDesired_.store(false);
+  stopRequested_.store(true);
+  frameInFlight_.store(false);
+
+  if (currentReply_) {
+    currentReply_->disconnect();
+    currentReply_->abort();
+    currentReply_->deleteLater();
+    currentReply_ = nullptr;
   }
 
   if (worker_.joinable()) {
     worker_.join();
   }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    destroyRoomLocked();
+  }
+
+  fpsFrameCount_ = 0;
 }
 
 void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
@@ -125,7 +161,7 @@ void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
   currentReply_ = nullptr;
   reply->deleteLater();
 
-  if (stopRequested_.load()) {
+  if (stopRequested_.load() || !receivingDesired_.load()) {
     return;
   }
 
@@ -163,13 +199,31 @@ void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
     return;
   }
 
+  if (stopRequested_.load() || !receivingDesired_.load()) {
+    return;
+  }
+
   const QString wssUrl = httpsToWss(apiUrl);
   worker_ = std::thread(&LiveKitPlayer::connectWorker, this, wssUrl, apiUrl,
                         token);
 }
 
+void LiveKitPlayer::onTrackPublished(
+    livekit::Room & /* room */, const livekit::TrackPublishedEvent &event) {
+  if (!event.publication || !event.participant ||
+      event.publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!room_ || stopRequested_.load()) {
+    return;
+  }
+  trySubscribePublication(event.publication, event.participant);
+}
+
 void LiveKitPlayer::onTrackSubscribed(
-    livekit::Room &room, const livekit::TrackSubscribedEvent &event) {
+    livekit::Room & /* room */, const livekit::TrackSubscribedEvent &event) {
   if (!event.track || event.track->kind() != livekit::TrackKind::KIND_VIDEO ||
       event.participant == nullptr) {
     return;
@@ -192,39 +246,26 @@ void LiveKitPlayer::onTrackSubscribed(
         .arg(QString::fromStdString(event.publication->mimeType())));
 
     emit mimeTypeReceived(event.publication->mimeType());
-
-    const int reqW = requestedWidth_.load();
-    const int reqH = requestedHeight_.load();
-    if (reqW > 0 && reqH > 0) {
-      event.publication->setVideoQuality(livekit::RemoteVideoQuality::Low);
-      event.publication->setVideoDimensions(
-          static_cast<std::uint32_t>(reqW), static_cast<std::uint32_t>(reqH));
-      emit statusChanged(
-          QStringLiteral("Requested video dimensions: %1x%2").arg(reqW).arg(reqH));
-    }
+    applyVideoDimensions(event.publication);
   }
-
-
-  livekit::VideoStream::Options options;
-  options.capacity = 2;
-  options.format = livekit::VideoBufferType::I420;
 
   const std::string participantIdentity = event.participant->identity();
   const std::string trackName = event.track->name();
 
-  room.setOnVideoFrameCallback(
-      participantIdentity, trackName,
-      [this](const livekit::VideoFrame &frame, std::int64_t /* timestampUs */) {
-        if (!stopRequested_.load()) {
-          emitFrameFromLiveKit(frame);
-        }
-      },
-      options);
-
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stopRequested_.load() || !room_) {
+      return;
+    }
     activeParticipantIdentity_ = participantIdentity;
     activeTrackName_ = trackName;
+    activePublication_ = event.publication;
+    if (event.publication) {
+      activeTrackSource_ = event.publication->source();
+    } else if (event.track->source()) {
+      activeTrackSource_ = *event.track->source();
+    }
+    ensureVideoCallbackRegisteredLocked();
   }
 
   emit statusChanged(QStringLiteral("Playing track '%1' from '%2'")
@@ -233,15 +274,19 @@ void LiveKitPlayer::onTrackSubscribed(
 }
 
 void LiveKitPlayer::onTrackUnsubscribed(
-    livekit::Room &room, const livekit::TrackUnsubscribedEvent & /* event */) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  clearActiveVideoCallbackLocked();
-  Q_UNUSED(room);
+    livekit::Room & /* room */, const livekit::TrackUnsubscribedEvent & /* event */) {
   emit statusChanged(QStringLiteral("Video track unsubscribed"));
 }
 
 void LiveKitPlayer::onDisconnected(
     livekit::Room & /* room */, const livekit::DisconnectedEvent & /* event */) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  videoCallbackRegistered_ = false;
+  activePublication_.reset();
+  activeParticipantIdentity_.clear();
+  activeTrackName_.clear();
+  activeTrackSource_ = livekit::TrackSource::SOURCE_UNKNOWN;
+  room_.reset();
   emit statusChanged(QStringLiteral("Disconnected from LiveKit room"));
 }
 
@@ -261,28 +306,161 @@ void LiveKitPlayer::onTrackSubscriptionFailed(
                QString::fromStdString(event.error)));
 }
 
+void LiveKitPlayer::applyVideoDimensions(
+    const std::shared_ptr<livekit::RemoteTrackPublication> &publication) {
+  if (!publication) {
+    return;
+  }
+  const int reqW = requestedWidth_.load();
+  const int reqH = requestedHeight_.load();
+  if (reqW > 0 && reqH > 0) {
+    publication->setVideoQuality(livekit::RemoteVideoQuality::Low);
+    publication->setVideoDimensions(static_cast<std::uint32_t>(reqW),
+                                      static_cast<std::uint32_t>(reqH));
+    emit statusChanged(
+        QStringLiteral("Requested video dimensions: %1x%2").arg(reqW).arg(reqH));
+  }
+}
+
+void LiveKitPlayer::trySubscribePublication(
+    const std::shared_ptr<livekit::RemoteTrackPublication> &publication,
+    livekit::RemoteParticipant *participant) {
+  if (!publication || !participant || !room_) {
+    return;
+  }
+  if (publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+    return;
+  }
+
+  activeParticipantIdentity_ = participant->identity();
+  activeTrackName_ = publication->name();
+  activeTrackSource_ = publication->source();
+  activePublication_ = publication;
+
+  if (!receivingDesired_.load()) {
+    return;
+  }
+
+  applyVideoDimensions(publication);
+  publication->setSubscribed(true);
+}
+
+void LiveKitPlayer::scanAndSubscribeExistingTracksLocked() {
+  if (!room_) {
+    return;
+  }
+  for (const auto &participant : room_->remoteParticipants()) {
+    if (!participant) {
+      continue;
+    }
+    for (const auto &entry : participant->trackPublications()) {
+      const auto &publication = entry.second;
+      if (!publication ||
+          publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+        continue;
+      }
+      trySubscribePublication(publication, participant.get());
+      return;
+    }
+  }
+}
+
+void LiveKitPlayer::resumeReceivingLocked() {
+  if (!room_) {
+    return;
+  }
+  scanAndSubscribeExistingTracksLocked();
+  if (auto publication = activePublication_.lock()) {
+    if (!publication->subscribed()) {
+      applyVideoDimensions(publication);
+      publication->setSubscribed(true);
+    }
+  }
+}
+
+void LiveKitPlayer::pauseReceivingLocked() {
+  if (auto publication = activePublication_.lock()) {
+    publication->setSubscribed(false);
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  }
+}
+
+void LiveKitPlayer::ensureVideoCallbackRegisteredLocked() {
+  if (videoCallbackRegistered_ || !room_ ||
+      activeParticipantIdentity_.empty() || activeTrackName_.empty()) {
+    return;
+  }
+
+  livekit::VideoStream::Options options;
+  options.capacity = 2;
+  options.format = livekit::VideoBufferType::I420;
+
+  room_->setOnVideoFrameCallback(
+      activeParticipantIdentity_, activeTrackName_,
+      [this](const livekit::VideoFrame &frame, std::int64_t /* timestampUs */) {
+        if (receivingDesired_.load() && !stopRequested_.load()) {
+          emitFrameFromLiveKit(frame);
+        }
+      },
+      options);
+  videoCallbackRegistered_ = true;
+}
+
 void LiveKitPlayer::clearActiveVideoCallbackLocked() {
   if (!room_) {
     return;
   }
   if (!activeParticipantIdentity_.empty() && !activeTrackName_.empty()) {
-    room_->clearOnVideoFrameCallback(activeParticipantIdentity_, activeTrackName_);
+    room_->clearOnVideoFrameCallback(activeParticipantIdentity_,
+                                     activeTrackName_);
   }
+  videoCallbackRegistered_ = false;
   activeParticipantIdentity_.clear();
   activeTrackName_.clear();
+  activeTrackSource_ = livekit::TrackSource::SOURCE_UNKNOWN;
+  activePublication_.reset();
+}
+
+void LiveKitPlayer::destroyRoomLocked() {
+  if (!room_) {
+    return;
+  }
+
+  if (auto publication = activePublication_.lock()) {
+    publication->setSubscribed(false);
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  }
+
+  clearActiveVideoCallbackLocked();
+  room_->setDelegate(nullptr);
+  room_.reset();
+}
+
+void LiveKitPlayer::onRoomConnected() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (stopRequested_.load() || !room_) {
+    return;
+  }
+  if (receivingDesired_.load()) {
+    resumeReceivingLocked();
+  }
+  emit statusChanged(QStringLiteral("Connected. Waiting for remote video track..."));
 }
 
 void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
+  if (!receivingDesired_.load() || stopRequested_.load()) {
+    return;
+  }
   if (frame.width() < kMinFrameDimension ||
       frame.height() < kMinFrameDimension || frame.data() == nullptr) {
     return;
   }
   if (frame.type() != livekit::VideoBufferType::I420) {
-    return; // we requested I420; ignore anything else
+    return;
   }
 
   if (frameInFlight_.exchange(true)) {
-    return; // previous frame not yet consumed — drop this one
+    return;
   }
 
   const auto planes = frame.planeInfos();
@@ -314,7 +492,8 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
 
   ++fpsFrameCount_;
   const auto now = std::chrono::steady_clock::now();
-  const auto elapsed = std::chrono::duration<double>(now - fpsWindowStart_).count();
+  const auto elapsed =
+      std::chrono::duration<double>(now - fpsWindowStart_).count();
   if (elapsed >= 1.0) {
     const double fps = fpsFrameCount_ / elapsed;
     fpsFrameCount_ = 0;
@@ -335,18 +514,32 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
     }
   });
 
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (room_) {
+      QMetaObject::invokeMethod(this, &LiveKitPlayer::onRoomConnected,
+                                Qt::QueuedConnection);
+      return;
+    }
+  }
+
   livekit::RoomOptions options;
-  options.auto_subscribe = true;
+  options.auto_subscribe = false;
   options.dynacast = false;
 
   auto tryConnect = [&](const QString &url) -> std::unique_ptr<livekit::Room> {
-    if (stopRequested_.load()) return nullptr;
+    if (stopRequested_.load()) {
+      return nullptr;
+    }
     emit statusChanged(QStringLiteral("Connecting to LiveKit at %1...").arg(url));
     auto room = std::make_unique<livekit::Room>();
     room->setDelegate(this);
     const bool ok =
         room->Connect(url.toStdString(), token.toStdString(), options);
-    if (!ok) return nullptr;
+    if (!ok || stopRequested_.load()) {
+      room->setDelegate(nullptr);
+      return nullptr;
+    }
     return room;
   };
 
@@ -367,12 +560,14 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopRequested_.load()) {
+      room->setDelegate(nullptr);
       return;
     }
     room_ = std::move(room);
   }
 
-  emit statusChanged(QStringLiteral("Connected. Waiting for remote video track..."));
+  QMetaObject::invokeMethod(this, &LiveKitPlayer::onRoomConnected,
+                            Qt::QueuedConnection);
 }
 
 QString LiveKitPlayer::connectionStateToString(livekit::ConnectionState state) {

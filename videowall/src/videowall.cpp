@@ -428,7 +428,7 @@ VideoWall::VideoWall(QWidget *parent) : QWidget(parent) {
 }
 
 VideoWall::~VideoWall() {
-  clearPlayers();
+  shutdownAllPlayers();
 }
 
 void VideoWall::createUi() {
@@ -573,44 +573,72 @@ void VideoWall::startPlayback() {
   }
   setButtonStates(true);
 
-  clearPlayers();
+  pauseAllPlayers();
   grid_->setStreamCount(cameras_.size());
 
-  players_.reserve(cameras_.size());
+  ensurePlayers(cameras_.size());
   for (int i = 0; i < cameras_.size(); ++i) {
-    auto *player = new LiveKitPlayer(this);
-
-    connect(player, &LiveKitPlayer::frameReady, this,
-            [this, player, i](const YuvFrame &frame) {
-              player->clearFrameInFlight();
-              grid_->uploadFrame(i, frame);
-            });
-    connect(player, &LiveKitPlayer::mimeTypeReceived, this,
-            [this, i](const std::string &mime) { grid_->setSlotMime(i, mime); });
-    connect(player, &LiveKitPlayer::statusChanged, this,
-            [this, i](const QString &s) { onSlotStatusChanged(i, s); });
-    connect(player, &LiveKitPlayer::errorOccurred, this,
-            [this, i](const QString &e) { onSlotError(i, e); });
-
-    players_.append(player);
-    player->startPlayback(bearerJwt_, cameras_[i]);
+    connectPlayerSignals(i);
+    players_[i]->startPlayback(bearerJwt_, cameras_[i]);
   }
 }
 
 void VideoWall::stopPlayback() {
-  clearPlayers();
+  pauseAllPlayers();
   grid_->clearAll();
   setButtonStates(false);
   statusLabel_->setText(QStringLiteral("Stopped"));
 }
 
-void VideoWall::clearPlayers() {
+void VideoWall::pauseAllPlayers() {
   for (auto *player : players_) {
-    player->disconnect();
-    player->stopPlayback();
+    disconnect(player, nullptr, this, nullptr);
+    player->pauseReceiving();
+  }
+}
+
+void VideoWall::shutdownAllPlayers() {
+  for (auto *player : players_) {
+    disconnect(player, nullptr, this, nullptr);
+    player->shutdownPlayback();
     delete player;
   }
   players_.clear();
+}
+
+void VideoWall::ensurePlayers(int streamCount) {
+  while (players_.size() < streamCount) {
+    players_.append(new LiveKitPlayer(this));
+  }
+  while (players_.size() > streamCount) {
+    auto *player = players_.takeLast();
+    disconnect(player, nullptr, this, nullptr);
+    player->shutdownPlayback();
+    delete player;
+  }
+}
+
+void VideoWall::connectPlayerSignals(int slotIndex) {
+  LiveKitPlayer *player = players_[slotIndex];
+  disconnect(player, nullptr, this, nullptr);
+
+  connect(player, &LiveKitPlayer::frameReady, this,
+          [this, player, slotIndex](const YuvFrame &frame) {
+            player->clearFrameInFlight();
+            grid_->uploadFrame(slotIndex, frame);
+          });
+  connect(player, &LiveKitPlayer::mimeTypeReceived, this,
+          [this, slotIndex](const std::string &mime) {
+            grid_->setSlotMime(slotIndex, mime);
+          });
+  connect(player, &LiveKitPlayer::statusChanged, this,
+          [this, slotIndex](const QString &s) {
+            onSlotStatusChanged(slotIndex, s);
+          });
+  connect(player, &LiveKitPlayer::errorOccurred, this,
+          [this, slotIndex](const QString &e) {
+            onSlotError(slotIndex, e);
+          });
 }
 
 void VideoWall::onSlotStatusChanged(int slotIndex, const QString &status) {
