@@ -11,7 +11,6 @@
 #include <thread>
 
 #include "livekit/livekit.h"
-#include "yuvbufferpool.h"
 #include "yuvframe.h"
 
 class QNetworkAccessManager;
@@ -84,8 +83,6 @@ private:
 
   int fpsFrameCount_{0};
   std::chrono::steady_clock::time_point fpsWindowStart_{};
-
-  std::shared_ptr<YuvBufferPool> framePool_{std::make_shared<YuvBufferPool>()};
 
   QNetworkAccessManager *nam_{nullptr};
   QNetworkReply *currentReply_{nullptr};

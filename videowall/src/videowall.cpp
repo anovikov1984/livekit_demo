@@ -233,8 +233,8 @@ void VideoGrid::reconcileSlots() {
 }
 
 void VideoGrid::uploadPlane(GLuint tex, GLuint pbo[2], int pboSize[2],
-                            int pboIdx, const std::uint8_t *data, int w, int h,
-                            int &cachedW, int &cachedH) {
+                            int pboIdx, const std::uint8_t *src, int srcStride,
+                            int w, int h, int &cachedW, int &cachedH) {
   const int bytes = w * h;
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo[pboIdx]);
   if (pboSize[pboIdx] != bytes) {
@@ -245,7 +245,15 @@ void VideoGrid::uploadPlane(GLuint tex, GLuint pbo[2], int pboSize[2],
                              GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT |
                                  GL_MAP_UNSYNCHRONIZED_BIT);
   if (p) {
-    std::memcpy(p, data, bytes);
+    if (srcStride == w) {
+      std::memcpy(p, src, static_cast<std::size_t>(bytes));
+    } else {
+      auto *dst = static_cast<std::uint8_t *>(p);
+      for (int row = 0; row < h; ++row) {
+        std::memcpy(dst + row * w, src + row * srcStride,
+                    static_cast<std::size_t>(w));
+      }
+    }
     glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
   }
   glBindTexture(GL_TEXTURE_2D, tex);
@@ -290,7 +298,7 @@ void VideoGrid::paintGL() {
     for (int i = 0; i < static_cast<int>(slots_.size()); ++i) {
       auto &s = slots_[i];
 
-      if (s.pending.y) {
+      if (s.pending) {
         const int w = s.pending.width;
         const int h = s.pending.height;
         const int cw = w / 2;
@@ -302,9 +310,20 @@ void VideoGrid::paintGL() {
           slotAspects_[i] = static_cast<float>(w) / static_cast<float>(h);
           layoutDirty_ = true;
         }
-        uploadPlane(s.texY, s.pboY, s.pboYSize, idx, s.pending.y->data(), w,  h,  s.yW, s.yH);
-        uploadPlane(s.texU, s.pboU, s.pboUSize, idx, s.pending.u->data(), cw, ch, s.uW, s.uH);
-        uploadPlane(s.texV, s.pboV, s.pboVSize, idx, s.pending.v->data(), cw, ch, s.vW, s.vH);
+        // I420: planes[0]=Y, [1]=U, [2]=V. Pointers stay valid until s.pending
+        // is reset below, which drops the last shared_ptr to the SDK frame.
+        const auto planes = s.pending.frame->planeInfos();
+        if (planes.size() >= 3) {
+          const auto *yPtr = reinterpret_cast<const std::uint8_t *>(planes[0].data_ptr);
+          const auto *uPtr = reinterpret_cast<const std::uint8_t *>(planes[1].data_ptr);
+          const auto *vPtr = reinterpret_cast<const std::uint8_t *>(planes[2].data_ptr);
+          uploadPlane(s.texY, s.pboY, s.pboYSize, idx, yPtr,
+                      static_cast<int>(planes[0].stride), w,  h,  s.yW, s.yH);
+          uploadPlane(s.texU, s.pboU, s.pboUSize, idx, uPtr,
+                      static_cast<int>(planes[1].stride), cw, ch, s.uW, s.uH);
+          uploadPlane(s.texV, s.pboV, s.pboVSize, idx, vPtr,
+                      static_cast<int>(planes[2].stride), cw, ch, s.vW, s.vH);
+        }
         s.pboIndex ^= 1;
         s.hasFrame = true;
         s.pending = YuvFrame{};

@@ -1,22 +1,22 @@
 #pragma once
 
+#include "livekit/video_frame.h"
+
 #include <QMetaType>
 
-#include <cstdint>
 #include <memory>
-#include <vector>
 
-// Planar I420 video frame carried across the SDK→GUI thread boundary.
-// Each plane is a tightly-packed (stride == width) byte buffer owned via
-// shared_ptr so Qt's queued-connection copy is a refcount bump rather than a
-// deep memcpy of pixel data.
+// Carries a LiveKit SDK video frame from the reader thread to the GL thread
+// without copying pixel data. The shared_ptr keeps the underlying plane
+// memory alive (FFI-owned in view mode, or the frame's std::vector<uint8_t>
+// in owned mode) until the GL thread finishes uploading it; Qt's queued
+// connection only bumps the refcount.
 struct YuvFrame {
-  using PlaneBuffer = std::shared_ptr<const std::vector<std::uint8_t>>;
-  PlaneBuffer y;   // width * height bytes
-  PlaneBuffer u;   // (width/2) * (height/2) bytes
-  PlaneBuffer v;   // (width/2) * (height/2) bytes
-  int width{0};    // luma plane width in pixels
-  int height{0};   // luma plane height in pixels
+  std::shared_ptr<const livekit::VideoFrame> frame;
+  int width{0};
+  int height{0};
+
+  explicit operator bool() const noexcept { return static_cast<bool>(frame); }
 };
 
 Q_DECLARE_METATYPE(YuvFrame)

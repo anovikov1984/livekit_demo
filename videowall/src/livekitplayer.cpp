@@ -13,7 +13,7 @@
 #include <QUrl>
 
 #include <cstdio>
-#include <cstring>
+#include <utility>
 
 namespace {
 constexpr const char *kCreateTokenUrl =
@@ -34,21 +34,6 @@ QString httpsToWss(const QString &url) {
 }
 
 constexpr int kMinFrameDimension = 1;
-
-void copyPlaneTight(std::uint8_t *dst, const livekit::VideoPlaneInfo &src,
-                    int planeW, int planeH) {
-  const std::uint8_t *srcPtr =
-      reinterpret_cast<const std::uint8_t *>(src.data_ptr);
-  const int srcStride = static_cast<int>(src.stride);
-  if (srcStride == planeW) {
-    std::memcpy(dst, srcPtr, static_cast<std::size_t>(planeW) * planeH);
-  } else {
-    for (int row = 0; row < planeH; ++row) {
-      std::memcpy(dst + row * planeW, srcPtr + row * srcStride,
-                  static_cast<std::size_t>(planeW));
-    }
-  }
-}
 } // namespace
 
 std::atomic_bool LiveKitPlayer::sdkInitialized_{false};
@@ -463,30 +448,19 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
     return;
   }
 
-  const auto planes = frame.planeInfos();
-  if (planes.size() < 3) {
-    frameInFlight_.store(false);
-    return;
-  }
-
   const int w = frame.width();
   const int h = frame.height();
-  const int cw = w / 2;
-  const int ch = h / 2;
 
-  auto y = framePool_->acquire(static_cast<std::size_t>(w) * h);
-  auto u = framePool_->acquire(static_cast<std::size_t>(cw) * ch);
-  auto v = framePool_->acquire(static_cast<std::size_t>(cw) * ch);
+  // Move the SDK frame into a shared holder so the GL thread can read its
+  // plane pointers directly. The `const_cast` is safe here because the SDK's
+  // reader loop (`VideoStream::read(VideoFrameEvent &ev)`) hands us a const
+  // reference to a non-const local that it overwrites on the next iteration;
+  // a moved-from VideoFrame is valid for the move-assignment that follows.
+  auto held = std::make_shared<livekit::VideoFrame>(
+      std::move(const_cast<livekit::VideoFrame &>(frame)));
 
-  copyPlaneTight(y->data(), planes[0], w, h);
-  copyPlaneTight(u->data(), planes[1], cw, ch);
-  copyPlaneTight(v->data(), planes[2], cw, ch);
-
-  YuvFrame out{
-      std::const_pointer_cast<const std::vector<std::uint8_t>>(std::move(y)),
-      std::const_pointer_cast<const std::vector<std::uint8_t>>(std::move(u)),
-      std::const_pointer_cast<const std::vector<std::uint8_t>>(std::move(v)),
-      w, h};
+  YuvFrame out{std::const_pointer_cast<const livekit::VideoFrame>(std::move(held)),
+               w, h};
 
   emit frameReady(out);
 

@@ -69,8 +69,8 @@ private:
 
   void reconcileSlots();
   void uploadPlane(GLuint tex, GLuint pbo[2], int pboSize[2], int pboIdx,
-                   const std::uint8_t *data, int w, int h, int &cachedW,
-                   int &cachedH);
+                   const std::uint8_t *src, int srcStride, int w, int h,
+                   int &cachedW, int &cachedH);
   void recomputeLayout();
   void computeVisualNumbers();
 
