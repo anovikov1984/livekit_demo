@@ -15,6 +15,7 @@
 
 class QNetworkAccessManager;
 class QNetworkReply;
+class QTimer;
 
 class LiveKitPlayer : public QObject, public livekit::RoomDelegate {
   Q_OBJECT
@@ -73,6 +74,9 @@ private:
   void connectWorker(QString wssUrl, QString httpsUrl, QString token);
   void logConnectionState(livekit::ConnectionState state);
   static QString connectionStateToString(livekit::ConnectionState state);
+  qint64 elapsedMs() const;
+  void startWatchdog();
+  void stopWatchdog();
 
   std::mutex mutex_;
   std::unique_ptr<livekit::Room> room_;
@@ -93,6 +97,12 @@ private:
   int fpsFrameCount_{0};
   std::chrono::steady_clock::time_point fpsWindowStart_{};
 
+  std::chrono::steady_clock::time_point playbackStart_{};
+  std::atomic<std::uint64_t> framesReceived_{0};
+  std::atomic<std::int64_t> lastFrameMonoMs_{0};
+  std::atomic_bool firstFrameLogged_{false};
+  QTimer *watchdog_{nullptr};
+
   QNetworkAccessManager *nam_{nullptr};
   QNetworkReply *currentReply_{nullptr};
 
@@ -102,4 +112,5 @@ private:
 
 private slots:
   void onRoomConnected();
+  void onWatchdogTick();
 };

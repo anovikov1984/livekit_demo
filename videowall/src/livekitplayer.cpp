@@ -11,6 +11,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QTimer>
 #include <QUrl>
 
 #include <cstdio>
@@ -50,6 +51,70 @@ LiveKitPlayer::LiveKitPlayer(QObject *parent) : QObject(parent) {
   static std::once_flag metaTypeFlag;
   std::call_once(metaTypeFlag,
                  []() { qRegisterMetaType<YuvFrame>("YuvFrame"); });
+
+  watchdog_ = new QTimer(this);
+  watchdog_->setInterval(3000);
+  connect(watchdog_, &QTimer::timeout, this, &LiveKitPlayer::onWatchdogTick);
+}
+
+qint64 LiveKitPlayer::elapsedMs() const {
+  if (playbackStart_.time_since_epoch().count() == 0) {
+    return 0;
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - playbackStart_)
+      .count();
+}
+
+void LiveKitPlayer::startWatchdog() {
+  if (watchdog_) {
+    watchdog_->start();
+  }
+}
+
+void LiveKitPlayer::stopWatchdog() {
+  if (watchdog_) {
+    watchdog_->stop();
+  }
+}
+
+void LiveKitPlayer::onWatchdogTick() {
+  if (!receivingDesired_.load()) {
+    stopWatchdog();
+    return;
+  }
+
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+
+  const auto frames = framesReceived_.load();
+  const auto lastFrameMs = lastFrameMonoMs_.load();
+  const auto nowMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  const auto sinceFrameMs = lastFrameMs > 0 ? (nowMs - lastFrameMs) : -1;
+
+  // Quiet path: frames are flowing and the most recent one is fresh.
+  if (frames > 0 && sinceFrameMs >= 0 && sinceFrameMs < 2000) {
+    return;
+  }
+
+  qWarning(
+      "[slot=%d cam=%s +%lldms] WATCHDOG stuck: room=%d cbReg=%d state=%s "
+      "frames=%llu sinceFrameMs=%lld part=%s track=%s",
+      slotIndex_,
+      cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+      static_cast<long long>(elapsedMs()),
+      room_ ? 1 : 0, videoCallbackRegistered_ ? 1 : 0,
+      qUtf8Printable(connectionStateToString(lastLoggedConnectionState_.load())),
+      static_cast<unsigned long long>(frames),
+      static_cast<long long>(sinceFrameMs),
+      activeParticipantIdentity_.empty() ? "-"
+                                         : activeParticipantIdentity_.c_str(),
+      activeTrackName_.empty() ? "-" : activeTrackName_.c_str());
 }
 
 LiveKitPlayer::~LiveKitPlayer() {
@@ -60,8 +125,18 @@ void LiveKitPlayer::startPlayback(const QString &bearerJwt,
                                   const QJsonObject &descriptor) {
   receivingDesired_.store(true);
   stopRequested_.store(false);
+  framesReceived_.store(0);
+  lastFrameMonoMs_.store(0);
+  firstFrameLogged_.store(false);
+  playbackStart_ = std::chrono::steady_clock::now();
 
   cameraLabel_ = descriptor.value(QStringLiteral("cameraId")).toString();
+
+  qInfo("[slot=%d cam=%s +0ms] startPlayback",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_));
+
+  startWatchdog();
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -95,6 +170,11 @@ void LiveKitPlayer::startPlayback(const QString &bearerJwt,
 }
 
 void LiveKitPlayer::pauseReceiving() {
+  qInfo("[slot=%d cam=%s +%lldms] pauseReceiving",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()));
+  stopWatchdog();
   receivingDesired_.store(false);
   frameInFlight_.store(false);
 
@@ -118,6 +198,11 @@ void LiveKitPlayer::pauseReceiving() {
 }
 
 void LiveKitPlayer::shutdownPlayback() {
+  qInfo("[slot=%d cam=%s +%lldms] shutdownPlayback",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()));
+  stopWatchdog();
   receivingDesired_.store(false);
   stopRequested_.store(true);
   frameInFlight_.store(false);
@@ -157,6 +242,12 @@ void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
       reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
   const QByteArray payload = reply->readAll();
 
+  qInfo("[slot=%d cam=%s +%lldms] token reply httpStatus=%d bytes=%lld",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()), httpStatus,
+        static_cast<long long>(payload.size()));
+
   if (reply->error() != QNetworkReply::NoError) {
     emit errorOccurred(QStringLiteral("Token HTTP error (%1): %2 %3")
                            .arg(httpStatus)
@@ -192,6 +283,11 @@ void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
   }
 
   const QString wssUrl = httpsToWss(apiUrl);
+  qInfo("[slot=%d cam=%s +%lldms] dispatching connectWorker apiUrl=%s wss=%s",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()), qUtf8Printable(apiUrl),
+        qUtf8Printable(wssUrl));
   worker_ = std::thread(&LiveKitPlayer::connectWorker, this, wssUrl, apiUrl,
                         token);
 }
@@ -283,7 +379,13 @@ void LiveKitPlayer::onTrackSubscribed(
 }
 
 void LiveKitPlayer::onTrackUnsubscribed(
-    livekit::Room & /* room */, const livekit::TrackUnsubscribedEvent & /* event */) {
+    livekit::Room & /* room */, const livekit::TrackUnsubscribedEvent &event) {
+  qInfo("[slot=%d cam=%s +%lldms] onTrackUnsubscribed track=%p part=%p",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()),
+        static_cast<void *>(event.track.get()),
+        static_cast<void *>(event.participant));
   emit statusChanged(QStringLiteral("Video track unsubscribed"));
 }
 
@@ -334,6 +436,11 @@ void LiveKitPlayer::logConnectionState(livekit::ConnectionState state) {
 void LiveKitPlayer::onTrackSubscriptionFailed(
     livekit::Room & /* room */,
     const livekit::TrackSubscriptionFailedEvent &event) {
+  qWarning("[slot=%d cam=%s +%lldms] onTrackSubscriptionFailed sid=%s err=%s",
+           slotIndex_,
+           cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+           static_cast<long long>(elapsedMs()), event.track_sid.c_str(),
+           event.error.c_str());
   emit errorOccurred(
       QStringLiteral("Track subscription failed for SID %1: %2")
           .arg(QString::fromStdString(event.track_sid),
@@ -360,6 +467,11 @@ void LiveKitPlayer::trySubscribePublication(
     const std::shared_ptr<livekit::RemoteTrackPublication> &publication,
     livekit::RemoteParticipant *participant) {
   if (!publication || !participant || !room_) {
+    qInfo("[slot=%d cam=%s +%lldms] trySubscribe: skip pub=%d part=%d room=%d",
+          slotIndex_,
+          cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+          static_cast<long long>(elapsedMs()),
+          publication ? 1 : 0, participant ? 1 : 0, room_ ? 1 : 0);
     return;
   }
   if (publication->kind() != livekit::TrackKind::KIND_VIDEO) {
@@ -372,9 +484,20 @@ void LiveKitPlayer::trySubscribePublication(
   activePublication_ = publication;
 
   if (!receivingDesired_.load()) {
+    qInfo("[slot=%d cam=%s +%lldms] trySubscribe: skip receivingDesired=0 "
+          "sid=%s",
+          slotIndex_,
+          cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+          static_cast<long long>(elapsedMs()), publication->sid().c_str());
     return;
   }
 
+  qInfo("[slot=%d cam=%s +%lldms] trySubscribe: setSubscribed(true) sid=%s "
+        "pid=%s name=%s",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()), publication->sid().c_str(),
+        participant->identity().c_str(), publication->name().c_str());
   applyVideoDimensions(publication);
   publication->setSubscribed(true);
 }
@@ -436,6 +559,15 @@ void LiveKitPlayer::pauseReceivingLocked() {
 void LiveKitPlayer::ensureVideoCallbackRegisteredLocked() {
   if (videoCallbackRegistered_ || !room_ ||
       activeParticipantIdentity_.empty() || activeTrackName_.empty()) {
+    qInfo("[slot=%d cam=%s +%lldms] ensureVideoCallback: skip cbReg=%d room=%d "
+          "pid=%s track=%s",
+          slotIndex_,
+          cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+          static_cast<long long>(elapsedMs()),
+          videoCallbackRegistered_ ? 1 : 0, room_ ? 1 : 0,
+          activeParticipantIdentity_.empty() ? "-"
+                                             : activeParticipantIdentity_.c_str(),
+          activeTrackName_.empty() ? "-" : activeTrackName_.c_str());
     return;
   }
 
@@ -452,6 +584,11 @@ void LiveKitPlayer::ensureVideoCallbackRegisteredLocked() {
       },
       options);
   videoCallbackRegistered_ = true;
+  qInfo("[slot=%d cam=%s +%lldms] videoCallback registered pid=%s track=%s",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()),
+        activeParticipantIdentity_.c_str(), activeTrackName_.c_str());
 }
 
 void LiveKitPlayer::clearActiveVideoCallbackLocked() {
@@ -486,6 +623,16 @@ void LiveKitPlayer::destroyRoomLocked() {
 
 void LiveKitPlayer::onRoomConnected() {
   std::lock_guard<std::mutex> lock(mutex_);
+  const std::size_t partCount =
+      room_ ? room_->remoteParticipants().size() : 0;
+  qInfo("[slot=%d cam=%s +%lldms] onRoomConnected room=%d participants=%zu "
+        "stopReq=%d recvDesired=%d",
+        slotIndex_,
+        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()),
+        room_ ? 1 : 0, partCount,
+        stopRequested_.load() ? 1 : 0,
+        receivingDesired_.load() ? 1 : 0);
   if (stopRequested_.load() || !room_) {
     return;
   }
@@ -505,6 +652,18 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
   }
   if (frame.type() != livekit::VideoBufferType::I420) {
     return;
+  }
+
+  const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+  framesReceived_.fetch_add(1);
+  lastFrameMonoMs_.store(nowMs);
+  if (!firstFrameLogged_.exchange(true)) {
+    qInfo("[slot=%d cam=%s +%lldms] FIRST FRAME %dx%d",
+          slotIndex_,
+          cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+          static_cast<long long>(elapsedMs()), frame.width(), frame.height());
   }
 
   if (frameInFlight_.exchange(true)) {
@@ -568,11 +727,20 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
     if (stopRequested_.load()) {
       return nullptr;
     }
+    qInfo("[slot=%d cam=%s +%lldms] worker: Connect() -> %s",
+          slotIndex_,
+          cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+          static_cast<long long>(elapsedMs()), qUtf8Printable(url));
     emit statusChanged(QStringLiteral("Connecting to LiveKit at %1...").arg(url));
     auto room = std::make_unique<livekit::Room>();
     room->setDelegate(this);
     const bool ok =
         room->Connect(url.toStdString(), token.toStdString(), options);
+    qInfo("[slot=%d cam=%s +%lldms] worker: Connect returned ok=%d url=%s",
+          slotIndex_,
+          cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+          static_cast<long long>(elapsedMs()), ok ? 1 : 0,
+          qUtf8Printable(url));
     if (!ok || stopRequested_.load()) {
       room->setDelegate(nullptr);
       return nullptr;
