@@ -115,6 +115,13 @@ void LiveKitPlayer::onWatchdogTick() {
       activeParticipantIdentity_.empty() ? "-"
                                          : activeParticipantIdentity_.c_str(),
       activeTrackName_.empty() ? "-" : activeTrackName_.c_str());
+
+  // Recovery: if connected but not yet receiving, re-scan for a video pub.
+  // Catches both "TrackPublishedEvent had null publication" and "publisher
+  // joined after our initial scan" cases.
+  if (room_ && !videoCallbackRegistered_ && !stopRequested_.load()) {
+    scanAndSubscribeExistingTracksLocked();
+  }
 }
 
 LiveKitPlayer::~LiveKitPlayer() {
@@ -299,26 +306,63 @@ void LiveKitPlayer::onTrackPublished(
       event.publication ? static_cast<int>(event.publication->kind()) : -1;
   const char *pid =
       event.participant ? event.participant->identity().c_str() : "?";
-  qInfo("[slot=%d camera=%s] onTrackPublished pub=%p part=%p pid=%s sid=%s kind=%d",
+  qInfo("[slot=%d cam=%s +%lldms] onTrackPublished pub=%p part=%p pid=%s "
+        "sid=%s kind=%d",
         slotIndex_,
         cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()),
         static_cast<void *>(event.publication.get()),
         static_cast<void *>(event.participant), pid, sid, kind);
 
-  if (!event.publication || !event.participant ||
-      event.publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+  if (!event.participant) {
+    return;
+  }
+
+  std::shared_ptr<livekit::RemoteTrackPublication> publication =
+      event.publication;
+  if (!publication) {
+    // SDK sometimes delivers a null publication in TrackPublishedEvent; try to
+    // recover by scanning the participant's known publications.
+    const auto pubs = event.participant->trackPublications();
+    for (const auto &entry : pubs) {
+      if (entry.second &&
+          entry.second->kind() == livekit::TrackKind::KIND_VIDEO) {
+        publication = entry.second;
+        break;
+      }
+    }
+    if (publication) {
+      qInfo("[slot=%d cam=%s +%lldms] onTrackPublished: recovered video pub "
+            "sid=%s from participant pid=%s",
+            slotIndex_,
+            cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+            static_cast<long long>(elapsedMs()), publication->sid().c_str(),
+            event.participant->identity().c_str());
+    } else {
+      qInfo("[slot=%d cam=%s +%lldms] onTrackPublished: null pub, no video "
+            "pub on participant pid=%s (watchdog will retry)",
+            slotIndex_,
+            cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+            static_cast<long long>(elapsedMs()),
+            event.participant->identity().c_str());
+      return;
+    }
+  }
+
+  if (publication->kind() != livekit::TrackKind::KIND_VIDEO) {
     return;
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  qInfo("[slot=%d camera=%s] onTrackPublished room_=%p stopRequested=%d sid=%s",
-        slotIndex_,
-        cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
-        static_cast<void *>(room_.get()), stopRequested_.load() ? 1 : 0, sid);
   if (!room_ || stopRequested_.load()) {
+    qInfo("[slot=%d cam=%s +%lldms] onTrackPublished: skip room=%d stopReq=%d",
+          slotIndex_,
+          cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+          static_cast<long long>(elapsedMs()),
+          room_ ? 1 : 0, stopRequested_.load() ? 1 : 0);
     return;
   }
-  trySubscribePublication(event.publication, event.participant);
+  trySubscribePublication(publication, event.participant);
 }
 
 void LiveKitPlayer::onTrackSubscribed(
@@ -392,11 +436,34 @@ void LiveKitPlayer::onTrackUnsubscribed(
 void LiveKitPlayer::onParticipantConnected(
     livekit::Room & /* room */,
     const livekit::ParticipantConnectedEvent &event) {
-  qInfo("[slot=%d camera=%s] onParticipantConnected part=%p pid=%s",
+  qInfo("[slot=%d cam=%s +%lldms] onParticipantConnected part=%p pid=%s",
         slotIndex_,
         cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+        static_cast<long long>(elapsedMs()),
         static_cast<void *>(event.participant),
         event.participant ? event.participant->identity().c_str() : "?");
+
+  if (!event.participant) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!room_ || stopRequested_.load() || !receivingDesired_.load()) {
+    return;
+  }
+  const auto pubs = event.participant->trackPublications();
+  for (const auto &entry : pubs) {
+    if (entry.second &&
+        entry.second->kind() == livekit::TrackKind::KIND_VIDEO) {
+      qInfo("[slot=%d cam=%s +%lldms] onParticipantConnected: existing video "
+            "pub sid=%s, subscribing",
+            slotIndex_,
+            cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
+            static_cast<long long>(elapsedMs()), entry.second->sid().c_str());
+      trySubscribePublication(entry.second, event.participant);
+      return;
+    }
+  }
 }
 
 void LiveKitPlayer::onDisconnected(
