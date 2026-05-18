@@ -663,6 +663,9 @@ void VideoWall::ensurePlayers(int streamCount) {
     player->shutdownPlayback();
     delete player;
   }
+  for (int i = 0; i < players_.size(); ++i) {
+    players_[i]->setSlotIndex(i);
+  }
 }
 
 void VideoWall::connectPlayerSignals(int slotIndex) {

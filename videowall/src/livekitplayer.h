@@ -27,6 +27,7 @@ public:
   void pauseReceiving();
   void shutdownPlayback();
   void clearFrameInFlight() { frameInFlight_.store(false); }
+  void setSlotIndex(int slotIndex) { slotIndex_ = slotIndex; }
 
   static void setRequestedDimensions(int width, int height);
 
@@ -45,6 +46,9 @@ protected:
                            const livekit::TrackUnsubscribedEvent &event) override;
   void onDisconnected(livekit::Room &room,
                       const livekit::DisconnectedEvent &event) override;
+  void onParticipantConnected(
+      livekit::Room &room,
+      const livekit::ParticipantConnectedEvent &event) override;
   void onConnectionStateChanged(
       livekit::Room &room,
       const livekit::ConnectionStateChangedEvent &event) override;
@@ -67,6 +71,7 @@ private:
   void emitFrameFromLiveKit(const livekit::VideoFrame &frame);
   void onTokenReply(QNetworkReply *reply);
   void connectWorker(QString wssUrl, QString httpsUrl, QString token);
+  void logConnectionState(livekit::ConnectionState state);
   static QString connectionStateToString(livekit::ConnectionState state);
 
   std::mutex mutex_;
@@ -76,6 +81,10 @@ private:
   std::atomic_bool stopRequested_{false};
   std::atomic_bool frameInFlight_{false};
   bool videoCallbackRegistered_{false};
+  std::atomic<livekit::ConnectionState> lastLoggedConnectionState_{
+      livekit::ConnectionState::Disconnected};
+  int slotIndex_{-1};
+  QString cameraLabel_;
   std::string activeParticipantIdentity_;
   std::string activeTrackName_;
   livekit::TrackSource activeTrackSource_{livekit::TrackSource::SOURCE_UNKNOWN};
