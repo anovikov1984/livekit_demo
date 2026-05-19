@@ -790,53 +790,65 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
   options.auto_subscribe = false;
   options.dynacast = false;
 
-  auto tryConnect = [&](const QString &url) -> std::unique_ptr<livekit::Room> {
+  // Assign room_ BEFORE Connect(): Connect() can fire delegate callbacks
+  // (onParticipantConnected, onTrackPublished) synchronously while it
+  // negotiates. Those handlers lock mutex_ and check room_ — if room_ is
+  // still null they early-return and the publication is dropped.
+  auto tryConnect = [&](const QString &url) -> bool {
     if (stopRequested_.load()) {
-      return nullptr;
+      return false;
     }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopRequested_.load()) {
+        return false;
+      }
+      room_ = std::make_unique<livekit::Room>();
+      room_->setDelegate(this);
+    }
+
     qInfo("[slot=%d cam=%s +%lldms] worker: Connect() -> %s",
           slotIndex_,
           cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
           static_cast<long long>(elapsedMs()), qUtf8Printable(url));
     emit statusChanged(QStringLiteral("Connecting to LiveKit at %1...").arg(url));
-    auto room = std::make_unique<livekit::Room>();
-    room->setDelegate(this);
+
+    // Connect() must be called without holding mutex_ so delegate callbacks
+    // it triggers can take the mutex and observe room_.
     const bool ok =
-        room->Connect(url.toStdString(), token.toStdString(), options);
+        room_->Connect(url.toStdString(), token.toStdString(), options);
+
     qInfo("[slot=%d cam=%s +%lldms] worker: Connect returned ok=%d url=%s",
           slotIndex_,
           cameraLabel_.isEmpty() ? "?" : qUtf8Printable(cameraLabel_),
           static_cast<long long>(elapsedMs()), ok ? 1 : 0,
           qUtf8Printable(url));
+
     if (!ok || stopRequested_.load()) {
-      room->setDelegate(nullptr);
-      return nullptr;
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (room_) {
+        room_->setDelegate(nullptr);
+        room_.reset();
+      }
+      return false;
     }
+
     logConnectionState(livekit::ConnectionState::Connected);
-    return room;
+    return true;
   };
 
-  auto room = tryConnect(wssUrl);
-  if (!room && !stopRequested_.load() && wssUrl != httpsUrl) {
+  bool ok = tryConnect(wssUrl);
+  if (!ok && !stopRequested_.load() && wssUrl != httpsUrl) {
     emit statusChanged(
         QStringLiteral("wss connect failed; retrying https..."));
-    room = tryConnect(httpsUrl);
+    ok = tryConnect(httpsUrl);
   }
 
-  if (!room) {
+  if (!ok) {
     if (!stopRequested_.load()) {
       emit errorOccurred(QStringLiteral("Failed to connect to LiveKit room"));
     }
     return;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (stopRequested_.load()) {
-      room->setDelegate(nullptr);
-      return;
-    }
-    room_ = std::move(room);
   }
 
   QMetaObject::invokeMethod(this, &LiveKitPlayer::onRoomConnected,
