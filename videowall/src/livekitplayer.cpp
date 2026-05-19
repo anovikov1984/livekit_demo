@@ -614,9 +614,21 @@ void LiveKitPlayer::resumeReceivingLocked() {
       publication->setSubscribed(true);
     }
   }
+  ensureVideoCallbackRegisteredLocked();
 }
 
 void LiveKitPlayer::pauseReceivingLocked() {
+  // The SDK tears down the per-track video frame callback on unsubscribe, so
+  // drop our registration too — otherwise the next resume's
+  // ensureVideoCallbackRegisteredLocked() would short-circuit on the stale
+  // videoCallbackRegistered_ flag and frames would never arrive.
+  if (room_ && !activeParticipantIdentity_.empty() &&
+      !activeTrackName_.empty()) {
+    room_->clearOnVideoFrameCallback(activeParticipantIdentity_,
+                                     activeTrackName_);
+  }
+  videoCallbackRegistered_ = false;
+
   if (auto publication = activePublication_.lock()) {
     publication->setSubscribed(false);
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
