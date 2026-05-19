@@ -23,7 +23,6 @@
 #include "livekit/room_event_types.h"
 #include "livekit/subscription_thread_dispatcher.h"
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
