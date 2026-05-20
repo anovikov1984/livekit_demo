@@ -12,7 +12,9 @@
 #include <QNetworkRequest>
 #include <QUrl>
 
+#include <cstdarg>
 #include <cstdio>
+#include <sstream>
 #include <utility>
 
 namespace {
@@ -31,6 +33,30 @@ QString httpsToWss(const QString &url) {
            url.mid(QStringLiteral("http://").size());
   }
   return url;
+}
+
+// Diagnostic logging: every line carries a monotonic millisecond stamp, the
+// per-player instance tag (truncated cameraId), and the current thread id, so
+// the SDK callback thread, the connect worker, and the Qt main thread can be
+// disambiguated when reading the captured stderr stream.
+void logLine(const char *tag, const char *fmt, ...) {
+  using namespace std::chrono;
+  const auto ms =
+      duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
+          .count();
+  std::ostringstream tid;
+  tid << std::this_thread::get_id();
+  char body[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(body, sizeof(body), fmt, ap);
+  va_end(ap);
+  std::fprintf(stderr, "%lld [LKP %s tid=%s] %s\n",
+               static_cast<long long>(ms),
+               tag ? tag : "?",
+               tid.str().c_str(),
+               body);
+  std::fflush(stderr);
 }
 
 constexpr int kMinFrameDimension = 1;
@@ -57,12 +83,35 @@ LiveKitPlayer::~LiveKitPlayer() {
 
 void LiveKitPlayer::startPlayback(const QString &bearerJwt,
                                   const QJsonObject &descriptor) {
+  // Derive a short per-camera tag for log disambiguation. Falls back to the
+  // object pointer if the JSON has no cameraId field.
+  if (instanceTag_.empty()) {
+    const QString cameraId =
+        descriptor.value(QStringLiteral("cameraId")).toString();
+    if (!cameraId.isEmpty()) {
+      const QString tail =
+          cameraId.right(6);
+      instanceTag_ = tail.toStdString();
+    } else {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%p", static_cast<void *>(this));
+      instanceTag_ = buf;
+    }
+  }
+
+  logLine(instanceTag_.c_str(),
+          "startPlayback: receivingDesired<-true room_=%s stopRequested=%s",
+          (room_ ? "set" : "null"),
+          stopRequested_.load() ? "true" : "false");
+
   receivingDesired_.store(true);
   stopRequested_.store(false);
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (room_) {
+      logLine(instanceTag_.c_str(),
+              "startPlayback: room_ already set -> resumeReceivingLocked");
       resumeReceivingLocked();
       emit statusChanged(QStringLiteral("Resuming on existing room connection..."));
       return;
@@ -73,6 +122,7 @@ void LiveKitPlayer::startPlayback(const QString &bearerJwt,
     nam_ = new QNetworkAccessManager(this);
   }
 
+  logLine(instanceTag_.c_str(), "startPlayback: requesting token");
   emit statusChanged(QStringLiteral("Requesting LiveKit token..."));
 
   QNetworkRequest req{QUrl(QString::fromLatin1(kCreateTokenUrl))};
@@ -92,6 +142,11 @@ void LiveKitPlayer::startPlayback(const QString &bearerJwt,
 }
 
 void LiveKitPlayer::pauseReceiving() {
+  logLine(instanceTag_.c_str(),
+          "pauseReceiving: room_=%s reply=%s worker=%s",
+          (room_ ? "set" : "null"),
+          (currentReply_ ? "live" : "null"),
+          (worker_.joinable() ? "joinable" : "none"));
   receivingDesired_.store(false);
   frameInFlight_.store(false);
 
@@ -112,9 +167,15 @@ void LiveKitPlayer::pauseReceiving() {
   }
 
   fpsFrameCount_ = 0;
+  firstFrameLogged_ = false;
 }
 
 void LiveKitPlayer::shutdownPlayback() {
+  logLine(instanceTag_.c_str(),
+          "shutdownPlayback: room_=%s reply=%s worker=%s",
+          (room_ ? "set" : "null"),
+          (currentReply_ ? "live" : "null"),
+          (worker_.joinable() ? "joinable" : "none"));
   receivingDesired_.store(false);
   stopRequested_.store(true);
   frameInFlight_.store(false);
@@ -136,6 +197,7 @@ void LiveKitPlayer::shutdownPlayback() {
   }
 
   fpsFrameCount_ = 0;
+  firstFrameLogged_ = false;
 }
 
 void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
@@ -147,12 +209,22 @@ void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
   reply->deleteLater();
 
   if (stopRequested_.load() || !receivingDesired_.load()) {
+    logLine(instanceTag_.c_str(),
+            "onTokenReply: aborted (stopRequested=%s receivingDesired=%s)",
+            stopRequested_.load() ? "true" : "false",
+            receivingDesired_.load() ? "true" : "false");
     return;
   }
 
   const int httpStatus =
       reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
   const QByteArray payload = reply->readAll();
+
+  logLine(instanceTag_.c_str(),
+          "onTokenReply: httpStatus=%d replyErr=%d payloadBytes=%lld",
+          httpStatus,
+          static_cast<int>(reply->error()),
+          static_cast<long long>(payload.size()));
 
   if (reply->error() != QNetworkReply::NoError) {
     emit errorOccurred(QStringLiteral("Token HTTP error (%1): %2 %3")
@@ -189,34 +261,116 @@ void LiveKitPlayer::onTokenReply(QNetworkReply *reply) {
   }
 
   const QString wssUrl = httpsToWss(apiUrl);
+  logLine(instanceTag_.c_str(),
+          "onTokenReply: launching connectWorker apiUrl=%s wssUrl=%s tokenLen=%d",
+          apiUrl.toStdString().c_str(),
+          wssUrl.toStdString().c_str(),
+          token.size());
   worker_ = std::thread(&LiveKitPlayer::connectWorker, this, wssUrl, apiUrl,
                         token);
 }
 
 void LiveKitPlayer::onTrackPublished(
     livekit::Room & /* room */, const livekit::TrackPublishedEvent &event) {
-  if (!event.publication || !event.participant ||
-      event.publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+  const bool pubNull = !event.publication;
+  const bool partNull = !event.participant;
+  logLine(instanceTag_.c_str(),
+          "onTrackPublished: pub=%s part=%s kind=%d source=%d name=%s sid=%s",
+          pubNull ? "null" : "ok",
+          partNull ? "null" : event.participant->identity().c_str(),
+          pubNull ? -1 : static_cast<int>(event.publication->kind()),
+          pubNull ? -1 : static_cast<int>(event.publication->source()),
+          pubNull ? "" : event.publication->name().c_str(),
+          pubNull ? "" : event.publication->sid().c_str());
+
+  // If the publication shared_ptr arrived null but we have a participant,
+  // dump what publications the participant currently knows about so we can
+  // tell whether the publication is reachable through participant->trackPublications().
+  if (!partNull) {
+    const auto &pubs = event.participant->trackPublications();
+    logLine(instanceTag_.c_str(),
+            "onTrackPublished: participant '%s' has trackPublications=%zu",
+            event.participant->identity().c_str(), pubs.size());
+    for (const auto &entry : pubs) {
+      const auto &p = entry.second;
+      if (!p) {
+        logLine(instanceTag_.c_str(),
+                "onTrackPublished:   pub map entry sid=%s value=null",
+                entry.first.c_str());
+        continue;
+      }
+      logLine(instanceTag_.c_str(),
+              "onTrackPublished:   pub map sid=%s name='%s' kind=%d source=%d subscribed=%s",
+              p->sid().c_str(), p->name().c_str(),
+              static_cast<int>(p->kind()),
+              static_cast<int>(p->source()),
+              p->subscribed() ? "true" : "false");
+    }
+  }
+
+  if (partNull) {
+    logLine(instanceTag_.c_str(),
+            "onTrackPublished: skip (null participant)");
     return;
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
   if (!room_ || stopRequested_.load()) {
+    logLine(instanceTag_.c_str(),
+            "onTrackPublished: DROP (room_=%s stopRequested=%s)",
+            room_ ? "set" : "null",
+            stopRequested_.load() ? "true" : "false");
     return;
   }
-  trySubscribePublication(event.publication, event.participant);
+
+  // The SDK can deliver TrackPublishedEvent with event.publication == nullptr
+  // even though the publication is already in the participant's
+  // trackPublications() map. Fall back to scanning the participant for an
+  // unsubscribed video publication so we don't lose the only notification.
+  std::shared_ptr<livekit::RemoteTrackPublication> pub = event.publication;
+  if (!pub || pub->kind() != livekit::TrackKind::KIND_VIDEO) {
+    for (const auto &entry : event.participant->trackPublications()) {
+      const auto &candidate = entry.second;
+      if (candidate &&
+          candidate->kind() == livekit::TrackKind::KIND_VIDEO &&
+          !candidate->subscribed()) {
+        pub = candidate;
+        logLine(instanceTag_.c_str(),
+                "onTrackPublished: fallback picked pub sid=%s from participant map",
+                pub->sid().c_str());
+        break;
+      }
+    }
+  }
+  if (!pub || pub->kind() != livekit::TrackKind::KIND_VIDEO) {
+    logLine(instanceTag_.c_str(),
+            "onTrackPublished: no video publication available, skipping");
+    return;
+  }
+
+  logLine(instanceTag_.c_str(),
+          "onTrackPublished: -> trySubscribePublication sid=%s",
+          pub->sid().c_str());
+  trySubscribePublication(pub, event.participant);
 }
 
 void LiveKitPlayer::onTrackSubscribed(
     livekit::Room & /* room */, const livekit::TrackSubscribedEvent &event) {
+  logLine(instanceTag_.c_str(),
+          "onTrackSubscribed: track=%s part=%s pub=%s",
+          event.track ? "ok" : "null",
+          event.participant ? event.participant->identity().c_str() : "null",
+          event.publication ? event.publication->sid().c_str() : "null");
   if (!event.track || event.track->kind() != livekit::TrackKind::KIND_VIDEO ||
       event.participant == nullptr) {
+    logLine(instanceTag_.c_str(),
+            "onTrackSubscribed: skip non-video or null fields");
     return;
   }
 
   if (event.publication) {
-    fprintf(stderr,
-            "[publication] sid=%s simulcast=%s published=%ux%u mime=%s\n",
+    logLine(instanceTag_.c_str(),
+            "onTrackSubscribed: pub sid=%s simulcast=%s pubWxH=%ux%u mime=%s",
             event.publication->sid().c_str(),
             event.publication->simulcasted() ? "true" : "false",
             event.publication->width(), event.publication->height(),
@@ -240,6 +394,10 @@ void LiveKitPlayer::onTrackSubscribed(
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopRequested_.load() || !room_) {
+      logLine(instanceTag_.c_str(),
+              "onTrackSubscribed: skip state apply (room_=%s stopRequested=%s)",
+              room_ ? "set" : "null",
+              stopRequested_.load() ? "true" : "false");
       return;
     }
     activeParticipantIdentity_ = participantIdentity;
@@ -253,18 +411,33 @@ void LiveKitPlayer::onTrackSubscribed(
     ensureVideoCallbackRegisteredLocked();
   }
 
+  logLine(instanceTag_.c_str(),
+          "onTrackSubscribed: now playing track='%s' from='%s'",
+          trackName.c_str(), participantIdentity.c_str());
   emit statusChanged(QStringLiteral("Playing track '%1' from '%2'")
                          .arg(QString::fromStdString(trackName),
                               QString::fromStdString(participantIdentity)));
 }
 
 void LiveKitPlayer::onTrackUnsubscribed(
-    livekit::Room & /* room */, const livekit::TrackUnsubscribedEvent & /* event */) {
+    livekit::Room & /* room */, const livekit::TrackUnsubscribedEvent &event) {
+  logLine(instanceTag_.c_str(),
+          "onTrackUnsubscribed: part=%s track=%s activePart='%s' activeTrack='%s'",
+          event.participant ? event.participant->identity().c_str() : "null",
+          event.track ? event.track->name().c_str() : "null",
+          activeParticipantIdentity_.c_str(),
+          activeTrackName_.c_str());
   emit statusChanged(QStringLiteral("Video track unsubscribed"));
 }
 
 void LiveKitPlayer::onDisconnected(
-    livekit::Room & /* room */, const livekit::DisconnectedEvent & /* event */) {
+    livekit::Room & /* room */, const livekit::DisconnectedEvent &event) {
+  logLine(instanceTag_.c_str(),
+          "onDisconnected: reason=%d activePart='%s' activeTrack='%s' "
+          "-> resetting room_ from inside delegate callback",
+          static_cast<int>(event.reason),
+          activeParticipantIdentity_.c_str(),
+          activeTrackName_.c_str());
   std::lock_guard<std::mutex> lock(mutex_);
   videoCallbackRegistered_ = false;
   activePublication_.reset();
@@ -278,6 +451,9 @@ void LiveKitPlayer::onDisconnected(
 void LiveKitPlayer::onConnectionStateChanged(
     livekit::Room & /* room */,
     const livekit::ConnectionStateChangedEvent &event) {
+  logLine(instanceTag_.c_str(),
+          "onConnectionStateChanged: state=%s",
+          connectionStateToString(event.state).toStdString().c_str());
   emit statusChanged(QStringLiteral("Connection state: %1")
                          .arg(connectionStateToString(event.state)));
 }
@@ -285,10 +461,61 @@ void LiveKitPlayer::onConnectionStateChanged(
 void LiveKitPlayer::onTrackSubscriptionFailed(
     livekit::Room & /* room */,
     const livekit::TrackSubscriptionFailedEvent &event) {
+  logLine(instanceTag_.c_str(),
+          "onTrackSubscriptionFailed: sid=%s error=%s",
+          event.track_sid.c_str(), event.error.c_str());
   emit errorOccurred(
       QStringLiteral("Track subscription failed for SID %1: %2")
           .arg(QString::fromStdString(event.track_sid),
                QString::fromStdString(event.error)));
+}
+
+void LiveKitPlayer::onParticipantConnected(
+    livekit::Room & /* room */,
+    const livekit::ParticipantConnectedEvent &event) {
+  logLine(instanceTag_.c_str(),
+          "onParticipantConnected: identity=%s kind=%d",
+          event.participant ? event.participant->identity().c_str() : "null",
+          event.participant ? static_cast<int>(event.participant->kind()) : -1);
+  if (event.participant) {
+    const auto &pubs = event.participant->trackPublications();
+    logLine(instanceTag_.c_str(),
+            "onParticipantConnected: trackPublications=%zu",
+            pubs.size());
+    for (const auto &entry : pubs) {
+      const auto &p = entry.second;
+      if (!p) {
+        logLine(instanceTag_.c_str(),
+                "onParticipantConnected:   pub sid=%s value=null",
+                entry.first.c_str());
+        continue;
+      }
+      logLine(instanceTag_.c_str(),
+              "onParticipantConnected:   pub sid=%s name='%s' kind=%d source=%d subscribed=%s",
+              p->sid().c_str(), p->name().c_str(),
+              static_cast<int>(p->kind()),
+              static_cast<int>(p->source()),
+              p->subscribed() ? "true" : "false");
+    }
+  }
+}
+
+void LiveKitPlayer::onParticipantDisconnected(
+    livekit::Room & /* room */,
+    const livekit::ParticipantDisconnectedEvent &event) {
+  logLine(instanceTag_.c_str(),
+          "onParticipantDisconnected: identity=%s",
+          event.participant ? event.participant->identity().c_str() : "null");
+}
+
+void LiveKitPlayer::onReconnecting(livekit::Room & /* room */,
+                                   const livekit::ReconnectingEvent & /* event */) {
+  logLine(instanceTag_.c_str(), "onReconnecting");
+}
+
+void LiveKitPlayer::onReconnected(livekit::Room & /* room */,
+                                  const livekit::ReconnectedEvent & /* event */) {
+  logLine(instanceTag_.c_str(), "onReconnected");
 }
 
 void LiveKitPlayer::applyVideoDimensions(
@@ -310,10 +537,21 @@ void LiveKitPlayer::applyVideoDimensions(
 void LiveKitPlayer::trySubscribePublication(
     const std::shared_ptr<livekit::RemoteTrackPublication> &publication,
     livekit::RemoteParticipant *participant) {
+  logLine(instanceTag_.c_str(),
+          "trySubscribePublication: pub=%s part=%s room_=%s subscribed=%s",
+          publication ? publication->sid().c_str() : "null",
+          participant ? participant->identity().c_str() : "null",
+          room_ ? "set" : "null",
+          publication ? (publication->subscribed() ? "true" : "false") : "?");
   if (!publication || !participant || !room_) {
+    logLine(instanceTag_.c_str(),
+            "trySubscribePublication: early return null");
     return;
   }
   if (publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+    logLine(instanceTag_.c_str(),
+            "trySubscribePublication: skip non-video kind=%d",
+            static_cast<int>(publication->kind()));
     return;
   }
 
@@ -323,31 +561,64 @@ void LiveKitPlayer::trySubscribePublication(
   activePublication_ = publication;
 
   if (!receivingDesired_.load()) {
+    logLine(instanceTag_.c_str(),
+            "trySubscribePublication: skip (receivingDesired=false)");
     return;
   }
 
   applyVideoDimensions(publication);
+  logLine(instanceTag_.c_str(),
+          "trySubscribePublication: calling setSubscribed(true) sid=%s name='%s'",
+          publication->sid().c_str(), publication->name().c_str());
   publication->setSubscribed(true);
+  logLine(instanceTag_.c_str(),
+          "trySubscribePublication: setSubscribed(true) returned, subscribed=%s",
+          publication->subscribed() ? "true" : "false");
 }
 
 void LiveKitPlayer::scanAndSubscribeExistingTracksLocked() {
   if (!room_) {
+    logLine(instanceTag_.c_str(), "scan: room_ is null");
     return;
   }
-  for (const auto &participant : room_->remoteParticipants()) {
+  const auto participants = room_->remoteParticipants();
+  logLine(instanceTag_.c_str(), "scan: remoteParticipants=%zu",
+          participants.size());
+  for (const auto &participant : participants) {
     if (!participant) {
+      logLine(instanceTag_.c_str(), "scan: null participant entry");
       continue;
     }
-    for (const auto &entry : participant->trackPublications()) {
+    const auto &pubs = participant->trackPublications();
+    logLine(instanceTag_.c_str(),
+            "scan: participant='%s' pubs=%zu",
+            participant->identity().c_str(), pubs.size());
+    for (const auto &entry : pubs) {
       const auto &publication = entry.second;
-      if (!publication ||
-          publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+      if (!publication) {
+        logLine(instanceTag_.c_str(),
+                "scan:   pub null entry");
         continue;
       }
+      logLine(instanceTag_.c_str(),
+              "scan:   pub sid=%s name='%s' kind=%d source=%d subscribed=%s",
+              publication->sid().c_str(),
+              publication->name().c_str(),
+              static_cast<int>(publication->kind()),
+              static_cast<int>(publication->source()),
+              publication->subscribed() ? "true" : "false");
+      if (publication->kind() != livekit::TrackKind::KIND_VIDEO) {
+        continue;
+      }
+      logLine(instanceTag_.c_str(),
+              "scan:   -> trySubscribePublication for sid=%s",
+              publication->sid().c_str());
       trySubscribePublication(publication, participant.get());
       return;
     }
   }
+  logLine(instanceTag_.c_str(),
+          "scan: no video publication found to subscribe");
 }
 
 void LiveKitPlayer::resumeReceivingLocked() {
@@ -371,6 +642,12 @@ void LiveKitPlayer::pauseReceivingLocked() {
 }
 
 void LiveKitPlayer::ensureVideoCallbackRegisteredLocked() {
+  logLine(instanceTag_.c_str(),
+          "ensureVideoCallbackRegisteredLocked: registered=%s room_=%s part='%s' track='%s'",
+          videoCallbackRegistered_ ? "true" : "false",
+          room_ ? "set" : "null",
+          activeParticipantIdentity_.c_str(),
+          activeTrackName_.c_str());
   if (videoCallbackRegistered_ || !room_ ||
       activeParticipantIdentity_.empty() || activeTrackName_.empty()) {
     return;
@@ -389,9 +666,16 @@ void LiveKitPlayer::ensureVideoCallbackRegisteredLocked() {
       },
       options);
   videoCallbackRegistered_ = true;
+  logLine(instanceTag_.c_str(),
+          "ensureVideoCallbackRegisteredLocked: setOnVideoFrameCallback registered");
 }
 
 void LiveKitPlayer::clearActiveVideoCallbackLocked() {
+  logLine(instanceTag_.c_str(),
+          "clearActiveVideoCallbackLocked: room_=%s part='%s' track='%s'",
+          room_ ? "set" : "null",
+          activeParticipantIdentity_.c_str(),
+          activeTrackName_.c_str());
   if (!room_) {
     return;
   }
@@ -422,8 +706,15 @@ void LiveKitPlayer::destroyRoomLocked() {
 }
 
 void LiveKitPlayer::onRoomConnected() {
+  logLine(instanceTag_.c_str(),
+          "onRoomConnected: room_=%s receivingDesired=%s stopRequested=%s",
+          room_ ? "set" : "null",
+          receivingDesired_.load() ? "true" : "false",
+          stopRequested_.load() ? "true" : "false");
   std::lock_guard<std::mutex> lock(mutex_);
   if (stopRequested_.load() || !room_) {
+    logLine(instanceTag_.c_str(),
+            "onRoomConnected: early return");
     return;
   }
   if (receivingDesired_.load()) {
@@ -442,6 +733,14 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
   }
   if (frame.type() != livekit::VideoBufferType::I420) {
     return;
+  }
+
+  if (!firstFrameLogged_) {
+    firstFrameLogged_ = true;
+    logLine(instanceTag_.c_str(),
+            "emitFrameFromLiveKit: FIRST FRAME %dx%d type=%d",
+            frame.width(), frame.height(),
+            static_cast<int>(frame.type()));
   }
 
   if (frameInFlight_.exchange(true)) {
@@ -481,6 +780,10 @@ void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
 
 void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
                                   QString token) {
+  logLine(instanceTag_.c_str(),
+          "connectWorker: enter wssUrl=%s httpsUrl=%s",
+          wssUrl.toStdString().c_str(),
+          httpsUrl.toStdString().c_str());
   static std::once_flag sdkInitFlag;
   std::call_once(sdkInitFlag, []() {
     if (livekit::initialize(livekit::LogLevel::Info, livekit::LogSink::kConsole)) {
@@ -491,6 +794,8 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (room_) {
+      logLine(instanceTag_.c_str(),
+              "connectWorker: room_ already set -> queue onRoomConnected");
       QMetaObject::invokeMethod(this, &LiveKitPlayer::onRoomConnected,
                                 Qt::QueuedConnection);
       return;
@@ -503,13 +808,24 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
 
   auto tryConnect = [&](const QString &url) -> std::unique_ptr<livekit::Room> {
     if (stopRequested_.load()) {
+      logLine(instanceTag_.c_str(),
+              "tryConnect: stopRequested before connect");
       return nullptr;
     }
+    logLine(instanceTag_.c_str(),
+            "tryConnect: creating Room and setDelegate(this) url=%s",
+            url.toStdString().c_str());
     emit statusChanged(QStringLiteral("Connecting to LiveKit at %1...").arg(url));
     auto room = std::make_unique<livekit::Room>();
     room->setDelegate(this);
+    logLine(instanceTag_.c_str(),
+            "tryConnect: calling Room::Connect()");
     const bool ok =
         room->Connect(url.toStdString(), token.toStdString(), options);
+    logLine(instanceTag_.c_str(),
+            "tryConnect: Connect returned ok=%s stopRequested=%s",
+            ok ? "true" : "false",
+            stopRequested_.load() ? "true" : "false");
     if (!ok || stopRequested_.load()) {
       room->setDelegate(nullptr);
       return nullptr;
@@ -519,12 +835,17 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
 
   auto room = tryConnect(wssUrl);
   if (!room && !stopRequested_.load() && wssUrl != httpsUrl) {
+    logLine(instanceTag_.c_str(),
+            "connectWorker: wss failed -> retrying https");
     emit statusChanged(
         QStringLiteral("wss connect failed; retrying https..."));
     room = tryConnect(httpsUrl);
   }
 
   if (!room) {
+    logLine(instanceTag_.c_str(),
+            "connectWorker: connect FAILED (stopRequested=%s)",
+            stopRequested_.load() ? "true" : "false");
     if (!stopRequested_.load()) {
       emit errorOccurred(QStringLiteral("Failed to connect to LiveKit room"));
     }
@@ -534,12 +855,18 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopRequested_.load()) {
+      logLine(instanceTag_.c_str(),
+              "connectWorker: stopRequested after connect, discarding room");
       room->setDelegate(nullptr);
       return;
     }
+    logLine(instanceTag_.c_str(),
+            "connectWorker: assigning room_ = std::move(room)");
     room_ = std::move(room);
   }
 
+  logLine(instanceTag_.c_str(),
+          "connectWorker: queuing onRoomConnected");
   QMetaObject::invokeMethod(this, &LiveKitPlayer::onRoomConnected,
                             Qt::QueuedConnection);
 }

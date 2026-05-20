@@ -51,6 +51,16 @@ protected:
   void onTrackSubscriptionFailed(
       livekit::Room &room,
       const livekit::TrackSubscriptionFailedEvent &event) override;
+  void onParticipantConnected(
+      livekit::Room &room,
+      const livekit::ParticipantConnectedEvent &event) override;
+  void onParticipantDisconnected(
+      livekit::Room &room,
+      const livekit::ParticipantDisconnectedEvent &event) override;
+  void onReconnecting(livekit::Room &room,
+                      const livekit::ReconnectingEvent &event) override;
+  void onReconnected(livekit::Room &room,
+                     const livekit::ReconnectedEvent &event) override;
 
 private:
   void clearActiveVideoCallbackLocked();
@@ -86,6 +96,9 @@ private:
 
   QNetworkAccessManager *nam_{nullptr};
   QNetworkReply *currentReply_{nullptr};
+
+  std::string instanceTag_;
+  bool firstFrameLogged_{false};
 
   static std::atomic_bool sdkInitialized_;
   static std::atomic<int> requestedWidth_;
