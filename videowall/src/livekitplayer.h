@@ -106,4 +106,5 @@ private:
 
 private slots:
   void onRoomConnected();
+  void retryDelayedScan(int remaining);
 };

@@ -10,6 +10,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QTimer>
 #include <QUrl>
 
 #include <cstdarg>
@@ -711,16 +712,57 @@ void LiveKitPlayer::onRoomConnected() {
           room_ ? "set" : "null",
           receivingDesired_.load() ? "true" : "false",
           stopRequested_.load() ? "true" : "false");
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (stopRequested_.load() || !room_) {
-    logLine(instanceTag_.c_str(),
-            "onRoomConnected: early return");
-    return;
+  bool needRetry = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopRequested_.load() || !room_) {
+      logLine(instanceTag_.c_str(),
+              "onRoomConnected: early return");
+      return;
+    }
+    if (receivingDesired_.load()) {
+      resumeReceivingLocked();
+    }
+    // Some publishers' track publications appear in the participant's map
+    // shortly after onRoomConnected runs, without ever firing a delegate
+    // event we can react to. Schedule a small number of delayed re-scans
+    // so we don't strand those slots indefinitely.
+    needRetry = !activePublication_.lock();
   }
-  if (receivingDesired_.load()) {
-    resumeReceivingLocked();
+  if (needRetry) {
+    QTimer::singleShot(250, this, [this]() { retryDelayedScan(3); });
   }
   emit statusChanged(QStringLiteral("Connected. Waiting for remote video track..."));
+}
+
+void LiveKitPlayer::retryDelayedScan(int remaining) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopRequested_.load() || !room_) {
+      return;
+    }
+    if (activePublication_.lock()) {
+      logLine(instanceTag_.c_str(),
+              "retryDelayedScan: already subscribed, stopping retries");
+      return;
+    }
+    logLine(instanceTag_.c_str(),
+            "retryDelayedScan: remaining=%d, re-scanning", remaining);
+    scanAndSubscribeExistingTracksLocked();
+    if (activePublication_.lock()) {
+      logLine(instanceTag_.c_str(),
+              "retryDelayedScan: subscribed via retry scan");
+      return;
+    }
+  }
+  if (remaining > 1) {
+    const int nextDelayMs = (remaining == 3) ? 750 : 1500;
+    QTimer::singleShot(nextDelayMs, this,
+                       [this, remaining]() { retryDelayedScan(remaining - 1); });
+  } else {
+    logLine(instanceTag_.c_str(),
+            "retryDelayedScan: gave up after retries");
+  }
 }
 
 void LiveKitPlayer::emitFrameFromLiveKit(const livekit::VideoFrame &frame) {
