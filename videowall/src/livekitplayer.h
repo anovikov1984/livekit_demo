@@ -8,7 +8,9 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "livekit/livekit.h"
 #include "yuvframe.h"
@@ -37,46 +39,47 @@ signals:
   void mimeTypeReceived(const std::string &mime);
 
 protected:
-  void onTrackPublished(livekit::Room &room,
-                        const livekit::TrackPublishedEvent &event) override;
-  void onTrackSubscribed(livekit::Room &room,
-                         const livekit::TrackSubscribedEvent &event) override;
-  void onTrackUnsubscribed(livekit::Room &room,
-                           const livekit::TrackUnsubscribedEvent &event) override;
-  void onDisconnected(livekit::Room &room,
-                      const livekit::DisconnectedEvent &event) override;
-  void onConnectionStateChanged(
-      livekit::Room &room,
-      const livekit::ConnectionStateChangedEvent &event) override;
-  void onTrackSubscriptionFailed(
-      livekit::Room &room,
-      const livekit::TrackSubscriptionFailedEvent &event) override;
   void onParticipantConnected(
       livekit::Room &room,
       const livekit::ParticipantConnectedEvent &event) override;
   void onParticipantDisconnected(
       livekit::Room &room,
       const livekit::ParticipantDisconnectedEvent &event) override;
-  void onReconnecting(livekit::Room &room,
-                      const livekit::ReconnectingEvent &event) override;
-  void onReconnected(livekit::Room &room,
-                     const livekit::ReconnectedEvent &event) override;
+  void onTrackPublished(livekit::Room &room,
+                        const livekit::TrackPublishedEvent &event) override;
+  void onTrackSubscribed(livekit::Room &room,
+                         const livekit::TrackSubscribedEvent &event) override;
+  void onTrackUnsubscribed(livekit::Room &room,
+                           const livekit::TrackUnsubscribedEvent &event) override;
+  void onTrackSubscriptionFailed(
+      livekit::Room &room,
+      const livekit::TrackSubscriptionFailedEvent &event) override;
+  void onDisconnected(livekit::Room &room,
+                      const livekit::DisconnectedEvent &event) override;
+  void onConnectionStateChanged(
+      livekit::Room &room,
+      const livekit::ConnectionStateChangedEvent &event) override;
 
 private:
-  void clearActiveVideoCallbackLocked();
-  void destroyRoomLocked();
-  void pauseReceivingLocked();
-  void resumeReceivingLocked();
-  void scanAndSubscribeExistingTracksLocked();
-  void trySubscribePublication(
-      const std::shared_ptr<livekit::RemoteTrackPublication> &publication,
-      livekit::RemoteParticipant *participant);
-  void applyVideoDimensions(
-      const std::shared_ptr<livekit::RemoteTrackPublication> &publication);
-  void ensureVideoCallbackRegisteredLocked();
-  void emitFrameFromLiveKit(const livekit::VideoFrame &frame);
+  struct SubscribedTrack {
+    std::shared_ptr<livekit::RemoteTrackPublication> publication;
+    std::string participantIdentity;
+    std::string trackName;
+  };
+
   void onTokenReply(QNetworkReply *reply);
   void connectWorker(QString wssUrl, QString httpsUrl, QString token);
+  void performTokenFetchAndConnect();
+  void attemptAutoReconnectLocked();
+  void subscribeParticipantLocked(livekit::RemoteParticipant *participant);
+  void registerTrackLocked(
+      const std::shared_ptr<livekit::RemoteTrackPublication> &publication,
+      const std::string &participantIdentity);
+  void registerFrameCallbackLocked(const std::string &participantIdentity,
+                                   const std::string &trackName);
+  void applyVideoDimensions(
+      const std::shared_ptr<livekit::RemoteTrackPublication> &publication);
+  void emitFrameFromLiveKit(const livekit::VideoFrame &frame);
   static QString connectionStateToString(livekit::ConnectionState state);
 
   std::mutex mutex_;
@@ -85,11 +88,8 @@ private:
   std::atomic_bool receivingDesired_{false};
   std::atomic_bool stopRequested_{false};
   std::atomic_bool frameInFlight_{false};
-  bool videoCallbackRegistered_{false};
-  std::string activeParticipantIdentity_;
-  std::string activeTrackName_;
-  livekit::TrackSource activeTrackSource_{livekit::TrackSource::SOURCE_UNKNOWN};
-  std::weak_ptr<livekit::RemoteTrackPublication> activePublication_;
+
+  std::vector<SubscribedTrack> streams_;
 
   int fpsFrameCount_{0};
   std::chrono::steady_clock::time_point fpsWindowStart_{};
@@ -97,8 +97,11 @@ private:
   QNetworkAccessManager *nam_{nullptr};
   QNetworkReply *currentReply_{nullptr};
 
-  std::string instanceTag_;
-  bool firstFrameLogged_{false};
+  std::string descriptorCameraId_;
+  int publisherCheckAttempt_{0};
+  QString bearerJwt_;
+  QJsonObject descriptor_;
+  int autoReconnectAttempt_{0};
 
   static std::atomic_bool sdkInitialized_;
   static std::atomic<int> requestedWidth_;
@@ -106,5 +109,6 @@ private:
 
 private slots:
   void onRoomConnected();
-  void retryDelayedScan(int remaining);
+  void logRoomSnapshot();
+  void publisherJoinCheck();
 };

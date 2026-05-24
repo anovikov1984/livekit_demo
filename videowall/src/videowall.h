@@ -22,6 +22,7 @@ class QLabel;
 class QOpenGLShaderProgram;
 class QPushButton;
 class QTextEdit;
+class QTimer;
 class LiveKitPlayer;
 
 // OpenGL grid renderer: N I420 streams as quads in a single QOpenGLWidget.
@@ -113,6 +114,7 @@ private slots:
   void stopPlayback();
   void onSlotStatusChanged(int slotIndex, const QString &status);
   void onSlotError(int slotIndex, const QString &errorMessage);
+  void checkSlotStalls();
 
 private:
   void createUi();
@@ -134,4 +136,8 @@ private:
   QString bearerJwt_;
   QVector<QJsonObject> cameras_;
   QVector<LiveKitPlayer *> players_;
+  QVector<bool> slotFirstFrameLogged_;
+  QVector<qint64> slotLastFrameMs_;
+  QVector<bool> slotStalled_;
+  QTimer *watchdogTimer_{nullptr};
 };

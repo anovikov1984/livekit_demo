@@ -1,7 +1,9 @@
 #include "videowall.h"
 
 #include "livekitplayer.h"
+#include "logger.h"
 
+#include <QDateTime>
 #include <QFont>
 #include <QHBoxLayout>
 #include <QPainter>
@@ -17,6 +19,7 @@
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QTextEdit>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <chrono>
@@ -530,6 +533,10 @@ void VideoWall::createUi() {
   grid_ = new VideoGrid(this);
   statusLabel_ = new QLabel(QStringLiteral("Idle"), this);
 
+  watchdogTimer_ = new QTimer(this);
+  watchdogTimer_->setInterval(1000);
+  connect(watchdogTimer_, &QTimer::timeout, this, &VideoWall::checkSlotStalls);
+
   fieldsWidget_ = new QWidget(this);
   auto *fieldsLayout = new QVBoxLayout(fieldsWidget_);
   fieldsLayout->setContentsMargins(0, 0, 0, 0);
@@ -620,17 +627,38 @@ void VideoWall::startPlayback() {
   }
   setButtonStates(true);
 
-  pauseAllPlayers();
   grid_->setStreamCount(cameras_.size());
 
   ensurePlayers(cameras_.size());
+  slotFirstFrameLogged_.fill(false, cameras_.size());
+  slotLastFrameMs_.fill(0, cameras_.size());
+  slotStalled_.fill(false, cameras_.size());
+
+  logEvent("VW", "PLAY_ALL_CLICKED cameras=%d players=%d", cameras_.size(),
+           players_.size());
+
   for (int i = 0; i < cameras_.size(); ++i) {
     connectPlayerSignals(i);
+    logEvent("VW", "  slot=%d -> startPlayback cameraId=%s", i,
+             cameras_[i]
+                 .value(QStringLiteral("cameraId"))
+                 .toString()
+                 .toStdString()
+                 .c_str());
     players_[i]->startPlayback(bearerJwt_, cameras_[i]);
   }
+  if (watchdogTimer_) {
+    watchdogTimer_->start();
+  }
+  statusLabel_->setText(
+      QStringLiteral("Starting %1 camera(s)...").arg(cameras_.size()));
 }
 
 void VideoWall::stopPlayback() {
+  logEvent("VW", "STOP_ALL_CLICKED players=%d", players_.size());
+  if (watchdogTimer_) {
+    watchdogTimer_->stop();
+  }
   pauseAllPlayers();
   grid_->clearAll();
   setButtonStates(false);
@@ -673,6 +701,21 @@ void VideoWall::connectPlayerSignals(int slotIndex) {
           [this, player, slotIndex](const YuvFrame &frame) {
             player->clearFrameInFlight();
             grid_->uploadFrame(slotIndex, frame);
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            if (slotIndex < slotLastFrameMs_.size()) {
+              slotLastFrameMs_[slotIndex] = now;
+            }
+            if (slotIndex < slotStalled_.size() && slotStalled_[slotIndex]) {
+              slotStalled_[slotIndex] = false;
+              logEvent("VW", "RESUMED slot=%d size=%dx%d", slotIndex,
+                       frame.width, frame.height);
+            }
+            if (slotIndex < slotFirstFrameLogged_.size() &&
+                !slotFirstFrameLogged_[slotIndex]) {
+              slotFirstFrameLogged_[slotIndex] = true;
+              logEvent("VW", "DISPLAY slot=%d size=%dx%d", slotIndex,
+                       frame.width, frame.height);
+            }
           });
   connect(player, &LiveKitPlayer::mimeTypeReceived, this,
           [this, slotIndex](const std::string &mime) {
@@ -696,6 +739,21 @@ void VideoWall::onSlotStatusChanged(int slotIndex, const QString &status) {
 void VideoWall::onSlotError(int slotIndex, const QString &errorMessage) {
   statusLabel_->setText(
       QStringLiteral("Slot %1 error: %2").arg(slotIndex).arg(errorMessage));
+}
+
+void VideoWall::checkSlotStalls() {
+  constexpr qint64 kStallMs = 3000;
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  for (int i = 0; i < slotLastFrameMs_.size(); ++i) {
+    if (slotLastFrameMs_[i] == 0) continue;
+    if (slotStalled_[i]) continue;
+    const qint64 elapsed = now - slotLastFrameMs_[i];
+    if (elapsed > kStallMs) {
+      slotStalled_[i] = true;
+      logEvent("VW", "STALL slot=%d elapsed_ms=%lld", i,
+               static_cast<long long>(elapsed));
+    }
+  }
 }
 
 void VideoWall::setButtonStates(bool isPlaying) {
