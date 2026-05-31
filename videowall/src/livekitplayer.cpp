@@ -16,10 +16,26 @@
 #include <utility>
 
 namespace {
-constexpr const char *kCreateTokenUrl =
-    "https://api-staging.lumix.ai/v1/live-view/lwebrtc/create-token/"
-    "65687f0364d1bb3b7b207c5c/6953cff92a13ade0364679ec/"
-    "6953ecc355947949135d3e08";
+constexpr const char *kCreateTokenUrlBase =
+    "https://api-staging.lumix.ai/v1/live-view/lwebrtc/create-token";
+
+// JWT is "<header>.<payload>.<signature>", each part base64url-encoded.
+// Decode the payload and return the "orgId" claim, or empty on failure.
+QString extractOrgIdFromJwt(const QString &jwt) {
+  const QStringList parts = jwt.split(QLatin1Char('.'));
+  if (parts.size() < 2) {
+    return {};
+  }
+  const QByteArray payload = QByteArray::fromBase64(
+      parts[1].toLatin1(),
+      QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+  QJsonParseError perr{};
+  const QJsonDocument doc = QJsonDocument::fromJson(payload, &perr);
+  if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
+    return {};
+  }
+  return doc.object().value(QStringLiteral("orgId")).toString();
+}
 
 QString httpsToWss(const QString &url) {
   if (url.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)) {
@@ -125,9 +141,25 @@ void LiveKitPlayer::performTokenFetchAndConnect() {
     nam_ = new QNetworkAccessManager(this);
   }
 
+  const QString orgId = extractOrgIdFromJwt(bearerJwt_);
+  const QString edgeId =
+      descriptor_.value(QStringLiteral("edgeId")).toString();
+  const QString cameraId =
+      descriptor_.value(QStringLiteral("cameraId")).toString();
+  if (orgId.isEmpty() || edgeId.isEmpty() || cameraId.isEmpty()) {
+    emit errorOccurred(
+        QStringLiteral("Cannot build token URL: missing orgId(jwt)='%1' "
+                       "edgeId='%2' cameraId='%3'")
+            .arg(orgId, edgeId, cameraId));
+    return;
+  }
+
   emit statusChanged(QStringLiteral("Requesting LiveKit token..."));
 
-  QNetworkRequest req{QUrl(QString::fromLatin1(kCreateTokenUrl))};
+  const QString tokenUrl = QStringLiteral("%1/%2/%3/%4")
+                               .arg(QString::fromLatin1(kCreateTokenUrlBase),
+                                    orgId, edgeId, cameraId);
+  QNetworkRequest req{QUrl(tokenUrl)};
   req.setHeader(QNetworkRequest::ContentTypeHeader,
                 QStringLiteral("application/json"));
   req.setRawHeader("Authorization",
@@ -164,7 +196,14 @@ void LiveKitPlayer::pauseReceiving() {
       logEvent("LK", "UNSUBSCRIBE participant=%s track=%s",
                s.participantIdentity.c_str(), s.trackName.c_str());
     }
+    // Bury the room so the SDK actually stops decoding. Leaving the
+    // room alive across pause means decoder threads keep running even
+    // after setSubscribed(false), producing background CPU with no
+    // visible output. The next Play All takes the fresh-token path.
+    buryRoom(std::move(room_));
+    logEvent("LK", "ROOM_TEARDOWN (pause)");
   }
+  streams_.clear();
   fpsFrameCount_ = 0;
 }
 
@@ -273,8 +312,12 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
   options.auto_subscribe = true;
   options.dynacast = false;
 
+  auto cancelled = [this]() {
+    return stopRequested_.load() || !receivingDesired_.load();
+  };
+
   auto tryConnect = [&](const QString &url) -> std::unique_ptr<livekit::Room> {
-    if (stopRequested_.load()) {
+    if (cancelled()) {
       return nullptr;
     }
     emit statusChanged(
@@ -284,10 +327,10 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
     room->setDelegate(this);
     const bool ok =
         room->Connect(url.toStdString(), token.toStdString(), options);
-    logEvent("LK", "CONNECT_RESULT url=%s ok=%d stopRequested=%d",
+    logEvent("LK", "CONNECT_RESULT url=%s ok=%d stopRequested=%d receiving=%d",
              url.toStdString().c_str(), ok ? 1 : 0,
-             stopRequested_.load() ? 1 : 0);
-    if (!ok || stopRequested_.load()) {
+             stopRequested_.load() ? 1 : 0, receivingDesired_.load() ? 1 : 0);
+    if (!ok || cancelled()) {
       buryRoom(std::move(room));
       return nullptr;
     }
@@ -295,13 +338,13 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
   };
 
   auto room = tryConnect(wssUrl);
-  if (!room && !stopRequested_.load() && wssUrl != httpsUrl) {
+  if (!room && !cancelled() && wssUrl != httpsUrl) {
     emit statusChanged(QStringLiteral("wss connect failed; retrying https..."));
     room = tryConnect(httpsUrl);
   }
 
   if (!room) {
-    if (!stopRequested_.load()) {
+    if (!cancelled()) {
       emit errorOccurred(QStringLiteral("Failed to connect to LiveKit room"));
     }
     return;
@@ -309,9 +352,17 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopRequested_.load()) {
+    // Re-check inside the lock so that a pauseReceiving()/shutdownPlayback()
+    // that interleaves with Connect() can't be silently undone here.
+    if (cancelled()) {
       buryRoom(std::move(room));
       return;
+    }
+    if (room_) {
+      // Defensive: never overwrite a live room_ with a synchronous destroy.
+      // Routes the previous room through the same deferred-destruction
+      // path used everywhere else.
+      buryRoom(std::move(room_));
     }
     room_ = std::move(room);
   }
@@ -323,7 +374,7 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
 void LiveKitPlayer::onRoomConnected() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopRequested_.load() || !room_) {
+    if (stopRequested_.load() || !receivingDesired_.load() || !room_) {
       return;
     }
     const auto participants = room_->remoteParticipants();
@@ -485,9 +536,33 @@ void LiveKitPlayer::onParticipantConnected(
 void LiveKitPlayer::onParticipantDisconnected(
     livekit::Room & /* room */,
     const livekit::ParticipantDisconnectedEvent &event) {
+  const std::string id =
+      event.participant ? event.participant->identity() : std::string{};
   logEvent("LK", "PARTICIPANT_LEFT id=%s",
-           event.participant ? event.participant->identity().c_str()
-                             : "<null>");
+           id.empty() ? "<null>" : id.c_str());
+
+  if (id.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  bool affected = false;
+  for (const auto &s : streams_) {
+    if (s.participantIdentity == id) {
+      if (room_) {
+        room_->clearOnVideoFrameCallback(s.participantIdentity, s.trackName);
+      }
+      affected = true;
+    }
+  }
+  if (!affected) {
+    return;
+  }
+  streams_.clear();
+  if (room_) {
+    logEvent("LK", "ROOM_TEARDOWN publisher_left=%s", id.c_str());
+    buryRoom(std::move(room_));
+  }
 }
 
 void LiveKitPlayer::onTrackPublished(
