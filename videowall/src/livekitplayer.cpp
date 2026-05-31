@@ -34,6 +34,26 @@ QString httpsToWss(const QString &url) {
 }
 
 constexpr int kMinFrameDimension = 1;
+
+// Defer Room destruction. The LiveKit SDK's FfiClient::PushEvent snapshots
+// listeners under its own lock and invokes them outside the lock, so an
+// in-flight Room::OnEvent invocation can race with ~Room: the destructor
+// unregisters the listener and then destroys lock_, but the already-dispatched
+// callback still tries to lock_guard<mutex>(lock_) on the destroyed mutex,
+// producing EINVAL -> std::system_error -> abort(). Room::OnEvent locks
+// before checking delegate_, so setDelegate(nullptr) alone does not avoid it.
+// Keep the Room alive long enough for any in-flight invocation to finish
+// against a valid mutex (delegate_ is null by then, so it's a no-op for us).
+void buryRoom(std::unique_ptr<livekit::Room> room) {
+  if (!room) {
+    return;
+  }
+  room->setDelegate(nullptr);
+  std::thread([keep = std::move(room)]() mutable {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    keep.reset();
+  }).detach();
+}
 } // namespace
 
 std::atomic_bool LiveKitPlayer::sdkInitialized_{false};
@@ -85,8 +105,7 @@ void LiveKitPlayer::startPlayback(const QString &bearerJwt,
       // The cached room is useless on retry; tear it down so the fresh-
       // fetch path below re-requests a token and connects again.
       logEvent("LK", "RESTART tearing down stale room (no cached streams)");
-      room_->setDelegate(nullptr);
-      room_.reset();
+      buryRoom(std::move(room_));
       streams_.clear();
     }
   }
@@ -172,8 +191,7 @@ void LiveKitPlayer::shutdownPlayback() {
       logEvent("LK", "UNSUBSCRIBE (shutdown) participant=%s track=%s",
                s.participantIdentity.c_str(), s.trackName.c_str());
     }
-    room_->setDelegate(nullptr);
-    room_.reset();
+    buryRoom(std::move(room_));
     logEvent("LK", "ROOM_TEARDOWN");
   }
   streams_.clear();
@@ -270,7 +288,7 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
              url.toStdString().c_str(), ok ? 1 : 0,
              stopRequested_.load() ? 1 : 0);
     if (!ok || stopRequested_.load()) {
-      room->setDelegate(nullptr);
+      buryRoom(std::move(room));
       return nullptr;
     }
     return room;
@@ -292,7 +310,7 @@ void LiveKitPlayer::connectWorker(QString wssUrl, QString httpsUrl,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopRequested_.load()) {
-      room->setDelegate(nullptr);
+      buryRoom(std::move(room));
       return;
     }
     room_ = std::move(room);
@@ -409,8 +427,7 @@ void LiveKitPlayer::attemptAutoReconnectLocked() {
     for (const auto &s : streams_) {
       room_->clearOnVideoFrameCallback(s.participantIdentity, s.trackName);
     }
-    room_->setDelegate(nullptr);
-    room_.reset();
+    buryRoom(std::move(room_));
   }
   streams_.clear();
   publisherCheckAttempt_ = 0;
@@ -555,7 +572,7 @@ void LiveKitPlayer::onDisconnected(
 
   std::lock_guard<std::mutex> lock(mutex_);
   streams_.clear();
-  room_.reset();
+  buryRoom(std::move(room_));
   emit statusChanged(QStringLiteral("Disconnected from LiveKit room"));
 }
 

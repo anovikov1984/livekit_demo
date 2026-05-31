@@ -44,6 +44,7 @@
 # Build directories
 build/
 cmake-build-*/
+.idea/
 
 # Local dependency scratch space
 .deps/
